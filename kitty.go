@@ -42,6 +42,13 @@ func kittyID(assetID string) int {
 	return int(h.Sum32()&0x3fffffff) + 1
 }
 
+// kittyDelete returns the sequence that deletes the image with the given id
+// (removes all its placements and frees its data). Used to clean up the
+// previously displayed preview once a new one is on screen.
+func kittyDelete(id int) string {
+	return fmt.Sprintf("\x1b_Ga=d,d=i,i=%d,q=2\x1b\\\\", id)
+}
+
 // detectImageProtocol resolves cfg.ImageProtocol: explicit "kitty"/"symbols"
 // wins; "auto" (or empty) checks kitty's env markers, TERM, and — inside
 // tmux — the terminal type of the attached client.

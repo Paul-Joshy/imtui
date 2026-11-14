@@ -105,13 +105,6 @@ var (
 
 type tickMsg struct{}
 
-// swapMsg replaces the fresh preview art (which carries the full image
-// transmission) with the cheap re-place sequence after it has been drawn.
-type swapMsg struct {
-	id    string
-	place string
-}
-
 type resultsMsg struct {
 	assets     []Asset
 	total      int
@@ -157,9 +150,13 @@ const (
 // cachedArt is a rendered preview: art is what's drawn first (symbols ANSI
 // or a kitty transmit+place); place is the cheap re-display sequence for
 // later frames (symbols mode leaves it empty — art is reused as-is).
+// fresh means art still carries the full transmit that has not been
+// swapped for place yet; shownAt is when it became the visible preview.
 type cachedArt struct {
-	art   string
-	place string
+	art     string
+	place   string
+	fresh   bool
+	shownAt time.Time
 }
 
 type model struct {
@@ -182,6 +179,7 @@ type model struct {
 	previewCache map[string]cachedArt
 	placeCache   map[string]string // "id:WxH" -> cheap re-place sequence (after first draw)
 	freshID      string            // asset whose preview still contains the transmit
+	lastKittyID  int               // kitty image id of the image currently on screen
 	detail       map[string]Asset
 	ocr          map[string]string
 	ocrShow      bool
@@ -344,6 +342,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fmt.Fprintf(os.Stderr, "[msg %T]\n", msg)
 		}
 	}
+	m.settleFreshPreview()
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -357,15 +356,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, fetchDetail(m.client, a.ID))
 			}
 			return m, tea.Batch(cmds...)
-		}
-
-	case swapMsg:
-		// the transmitted image has been drawn once; from now on the frame
-		// only needs the cheap re-place command.
-		if a := m.selected(); a != nil && m.freshID == msg.id && a.ID == msg.id && msg.place != "" {
-			m.placeCache[m.previewKey(msg.id)] = msg.place
-			m.preview = msg.place
-			m.freshID = ""
 		}
 
 	case resultsMsg:
@@ -415,18 +405,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "preview: " + msg.err.Error()
 		}
 		if msg.art != "" {
-			m.previewCache[m.previewKey(msg.id)] = cachedArt{art: msg.art, place: msg.place}
+			m.previewCache[m.previewKey(msg.id)] = cachedArt{
+				art:     msg.art,
+				place:   msg.place,
+				fresh:   m.proto == "kitty",
+				shownAt: time.Now(),
+			}
 		}
 		if a := m.selected(); a != nil && a.ID == msg.id && msg.art != "" {
 			m.preview = msg.art
 			m.freshID = msg.id
 			// pre-render the rows above/below so scrolling hits the cache
-			return m, tea.Batch(
-				m.preRenderNeighbors(),
-				tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg {
-					return swapMsg{id: msg.id, place: msg.place}
-				}),
-			)
+			return m, m.preRenderNeighbors()
 		}
 
 	case ocrMsg:
@@ -614,6 +604,45 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 	return m, nil
 }
 
+// settleFreshPreview runs at the start of every Update: when the selected
+// asset's preview still carries the full kitty transmit and has been on
+// screen long enough to have been flushed to the terminal, it swaps the view
+// to the cheap re-place sequence (plus a delete of the previously displayed
+// image, so old graphics don't stack up underneath). The swap changes the
+// rendered row, so the next redraw executes the sequences — ~30 bytes
+// instead of re-sending ~230KB on every subsequent frame.
+func (m *model) settleFreshPreview() {
+	if m.proto != "kitty" || m.freshID == "" {
+		return
+	}
+	a := m.selected()
+	if a == nil || a.ID != m.freshID {
+		return
+	}
+	key := m.previewKey(a.ID)
+	c, ok := m.previewCache[key]
+	if !ok || !c.fresh || c.place == "" {
+		return
+	}
+	// bubbletea flushes at ~60fps; if the next message arrives sooner than
+	// this, the transmit may not have reached the terminal yet — keep
+	// waiting rather than risk replacing it before it ever drew.
+	if time.Since(c.shownAt) < 50*time.Millisecond {
+		return
+	}
+	seq := c.place
+	if m.lastKittyID != 0 && m.lastKittyID != kittyID(a.ID) {
+		seq += kittyDelete(m.lastKittyID)
+	}
+	m.preview = seq
+	c.art = c.place // cache now serves the cheap sequence too
+	c.fresh = false
+	m.previewCache[key] = c
+	m.placeCache[key] = c.place
+	m.lastKittyID = kittyID(a.ID)
+	m.freshID = ""
+}
+
 // schedulePreview shows the preview for the selection: instantly from cache
 // when possible, otherwise schedules a debounced render. Returns the command
 // to run (detail fetch and/or tick), or nil.
@@ -634,15 +663,16 @@ func (m *model) schedulePreview() tea.Cmd {
 		return nil
 	}
 	if c, ok := m.previewCache[key]; ok {
+		if c.fresh {
+			// still carrying the transmit (pre-rendered neighbor): it will
+			// be swapped to place by settleFreshPreview once displayed.
+			c.shownAt = time.Now()
+			m.previewCache[key] = c
+		}
 		m.preview = c.art
 		m.freshID = a.ID
 		m.pending = ""
-		return tea.Batch(
-			fetchDetailIfMissing(m, a.ID),
-			tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg {
-				return swapMsg{id: a.ID, place: c.place}
-			}),
-		)
+		return fetchDetailIfMissing(m, a.ID)
 	}
 	m.pending = a.ID
 	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
@@ -876,7 +906,18 @@ func (m model) assetViewKitty() string {
 		if i < len(right) {
 			r = right[i]
 		}
-		rows = append(rows, l+"  "+r)
+		row := l + "  " + r
+		if i < m.previewH() {
+			// The image occupies previewH terminal rows starting at this
+			// pane's column. bubbletea appends ESC[K (erase to end of line)
+			// to every changed row narrower than the terminal, which would
+			// erase straight across the image cells on each scroll step.
+			// Appending a cursor-forward parks the cursor past the image's
+			// right edge, so the erase lands on empty space instead. CUF
+			// prints nothing, so it is safe even on the graphics line.
+			row += fmt.Sprintf("\x1b[%dC", m.previewW())
+		}
+		rows = append(rows, row)
 	}
 	return strings.Join(rows, "\n")
 }

@@ -46,6 +46,86 @@ func TestKittySequenceStructure(t *testing.T) {
 	}
 }
 
+func TestKittyDelete(t *testing.T) {
+	want := "\x1b_Ga=d,d=i,i=42,q=2\x1b\\\\"
+	if got := kittyDelete(42); got != want {
+		t.Fatalf("delete seq:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestSettleFreshPreview(t *testing.T) {
+	id := "11111111-2222-3333-4444-555555555555"
+	prev := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	m := model{
+		proto:   "kitty",
+		assets:  []Asset{{ID: id}},
+		cursor:  0,
+		freshID: id,
+		preview: "TRANSMIT+PLACE",
+		previewCache: map[string]cachedArt{
+			id + ":44x20": {art: "TRANSMIT+PLACE", place: "PLACE", fresh: true},
+		},
+		placeCache:  map[string]string{},
+		lastKittyID: kittyID(prev),
+		cfg:         Config{PreviewW: 44, PreviewH: 20},
+	}
+	m.width, m.height = 120, 34 // previewKey depends on the pane size
+
+	// too soon: the transmit may not have been flushed yet
+	c := m.previewCache[m.previewKey(id)]
+	c.shownAt = time.Now()
+	m.previewCache[m.previewKey(id)] = c
+	m.settleFreshPreview()
+	if m.preview != "TRANSMIT+PLACE" {
+		t.Fatalf("settled too early: preview = %q", m.preview)
+	}
+
+	// after the guard window: swap to place + delete the previous image
+	c.shownAt = time.Now().Add(-100 * time.Millisecond)
+	m.previewCache[m.previewKey(id)] = c
+	m.settleFreshPreview()
+	want := "PLACE" + kittyDelete(kittyID(prev))
+	if m.preview != want {
+		t.Fatalf("settled preview:\n got %q\nwant %q", m.preview, want)
+	}
+	if m.freshID != "" || m.lastKittyID != kittyID(id) {
+		t.Fatalf("state not updated: freshID=%q lastKittyID=%d", m.freshID, m.lastKittyID)
+	}
+	if c := m.previewCache[m.previewKey(id)]; c.fresh || c.art != "PLACE" {
+		t.Fatalf("cache not downgraded: %+v", c)
+	}
+	if m.placeCache[m.previewKey(id)] != "PLACE" {
+		t.Fatal("placeCache missing after settle")
+	}
+
+	// re-settling the same asset must not delete itself
+	m.settleFreshPreview()
+	if m.lastKittyID != kittyID(id) {
+		t.Fatalf("lastKittyID changed on re-settle: %d", m.lastKittyID)
+	}
+}
+
+func TestKittyErasePadding(t *testing.T) {
+	m := model{
+		proto:   "kitty",
+		assets:  []Asset{{ID: "x"}},
+		cursor:  0,
+		preview: "\x1b_Ga=T…\x1b\\\\",
+		cfg:     Config{PreviewW: 44, PreviewH: 20},
+	}
+	m.width, m.height = 120, 34
+	rows := strings.Split(m.assetViewKitty(), "\n")
+	for i := 0; i < 20; i++ {
+		if !strings.HasSuffix(rows[i], "\x1b[44C") {
+			t.Fatalf("row %d lacks cursor-forward padding: %q", i, rows[i])
+		}
+	}
+	// metadata rows below the image area must stay clean
+	if i := 20; i < len(rows) && strings.HasSuffix(rows[i], "\x1b[44C") {
+		t.Fatalf("metadata row %d should not be padded", i)
+	}
+}
+
 func TestTmuxPassthrough(t *testing.T) {
 	t.Setenv("TMUX", "/tmp/fake")
 	place := "\x1b_Ga=p,i=7,p=0,q=2,c=44,r=20\x1b\\"
