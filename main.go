@@ -254,8 +254,26 @@ func loadRecent(c *Client) tea.Cmd {
 // loadPerson lists a person's photos (paged by cursor).
 func loadPerson(c *Client, person string) tea.Cmd {
 	return func() tea.Msg {
-		assets, next, err := c.MetadataSearch([]string{person}, "", false)
-		return resultsMsg{assets: assets, nextCursor: next, err: err}
+		// a person's photos are a bounded set — fetch every page up front
+		// so the full count is visible immediately, instead of trickling
+		// in 100 at a time while scrolling
+		var all []Asset
+		cursor := ""
+		for page := 0; page < 200; page++ { // 200 pages = 20k photos, safety cap
+			assets, next, err := c.MetadataSearch([]string{person}, cursor, false)
+			if os.Getenv("IMTUI_DEBUG") != "" {
+				fmt.Fprintf(os.Stderr, "[person page=%d got=%d next=%q err=%v]\n", page, len(assets), next, err)
+			}
+			if err != nil {
+				return resultsMsg{assets: all, err: err}
+			}
+			all = append(all, assets...)
+			if next == "" || len(assets) == 0 {
+				break
+			}
+			cursor = next
+		}
+		return resultsMsg{assets: all, total: len(all)}
 	}
 }
 

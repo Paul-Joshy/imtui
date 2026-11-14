@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -144,10 +145,29 @@ type PersonFull struct {
 
 type searchResponse struct {
 	Assets struct {
-		Total      int     `json:"total"`
-		Items      []Asset `json:"items"`
-		NextCursor string  `json:"nextCursor"`
+		Total int     `json:"total"`
+		Items []Asset `json:"items"`
+		// the cursor field's name and type depend on the query style:
+		// filter-style searches return nextCursor (base64 offset, string);
+		// the deprecated top-level style returns nextPage (page number) —
+		// as a JSON number, hence RawMessage
+		NextCursor string          `json:"nextCursor"`
+		NextPage   json.RawMessage `json:"nextPage"`
 	} `json:"assets"`
+}
+
+// cursor returns the paging cursor for the response as a string, from
+// whichever field the server populated.
+func (sr searchResponse) cursor() string {
+	if sr.Assets.NextCursor != "" {
+		return sr.Assets.NextCursor
+	}
+	p := strings.TrimSpace(string(sr.Assets.NextPage))
+	p = strings.Trim(p, `"`)
+	if p == "" || p == "null" {
+		return ""
+	}
+	return p
 }
 
 // ---------- calls ----------
@@ -318,13 +338,23 @@ func (c *Client) RenamePerson(id, name string) error {
 func (c *Client) MetadataSearch(personIDs []string, cursor string, newestFirst bool) ([]Asset, string, error) {
 	req := map[string]any{"size": 100}
 	if len(personIDs) > 0 {
+		// The deprecated top-level personIds pages by page NUMBER: a cursor
+		// alongside it is rejected, and the v3 filter style silently drops
+		// the person filter once a cursor is present (server-side). So
+		// person browse sends page numbers; the cursor carries "2", "3", …
 		req["personIds"] = personIDs
-	}
-	if cursor != "" {
-		req["cursor"] = cursor
-	}
-	if newestFirst {
-		req["orderBy"] = map[string]string{"field": "fileCreatedAt", "direction": "desc"}
+		if cursor != "" {
+			if n, err := strconv.Atoi(cursor); err == nil && n > 1 {
+				req["page"] = n
+			}
+		}
+	} else {
+		if cursor != "" {
+			req["cursor"] = cursor
+		}
+		if newestFirst {
+			req["orderBy"] = map[string]string{"field": "fileCreatedAt", "direction": "desc"}
+		}
 	}
 	b, err := c.do("POST", "/search/metadata", req)
 	if err != nil {
@@ -334,7 +364,7 @@ func (c *Client) MetadataSearch(personIDs []string, cursor string, newestFirst b
 	if err := json.Unmarshal(b, &sr); err != nil {
 		return nil, "", err
 	}
-	return sr.Assets.Items, sr.Assets.NextCursor, nil
+	return sr.Assets.Items, sr.cursor(), nil
 }
 
 // Original downloads the asset's original file (full resolution, original

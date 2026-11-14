@@ -17,7 +17,8 @@ browser.
 
 ## Features
 
-- **Browse** — newest photos first, paged as you scroll
+- **Browse** — newest photos first, paged as you scroll; entering a person
+  loads their entire photo set up front, with the full count
 - **Real-pixel previews** — in kitty/ghostty-class terminals, photos are
   drawn with the kitty graphics protocol; in iTerm2 they use iTerm2's own
   inline-image protocol (actual pixels, not ASCII art); it falls back to
