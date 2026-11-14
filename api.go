@@ -60,12 +60,12 @@ func (c *Client) do(method, path string, body any) ([]byte, error) {
 // ---------- types ----------
 
 type Asset struct {
-	ID               string   `json:"id"`
-	Type             string   `json:"type"`
-	OriginalFileName string   `json:"originalFileName"`
-	CreatedAt        string   `json:"createdAt"`
+	ID               string    `json:"id"`
+	Type             string    `json:"type"`
+	OriginalFileName string    `json:"originalFileName"`
+	CreatedAt        string    `json:"createdAt"`
 	ExifInfo         *ExifInfo `json:"exifInfo"`
-	People           []Person `json:"people"`
+	People           []Person  `json:"people"`
 }
 
 type ExifInfo struct {

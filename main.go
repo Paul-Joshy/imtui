@@ -5,7 +5,8 @@
 // through chafa.
 //
 // Keys: j/k move · / search · p people · s similar (search by image) ·
-//       e description · t OCR text · o open in browser · q quit
+//
+//	e description · t OCR text · o open in browser · q quit
 package main
 
 import (
@@ -149,12 +150,13 @@ type model struct {
 	person     string // person id when view==person
 	people     []PersonFull
 
-	cursor  int
-	preview string // chafa ANSI art of the selected asset
-	pending string // asset id queued for preview render
-	detail  map[string]Asset
-	ocr     map[string]string
-	ocrShow bool
+	cursor       int
+	preview      string            // chafa ANSI art of the selected asset
+	pending      string            // asset id queued for preview render
+	previewCache map[string]string // "id:WxH" -> rendered art (this session)
+	detail       map[string]Asset
+	ocr          map[string]string
+	ocrShow      bool
 
 	// input line
 	input    textinput.Model
@@ -172,12 +174,13 @@ func initialModel(c *Client, cfg Config) model {
 	ti.CharLimit = 300
 	ti.Width = 60
 	return model{
-		client: c,
-		cfg:    cfg,
-		view:   "recent",
-		detail: map[string]Asset{},
-		ocr:    map[string]string{},
-		input:  ti,
+		client:       c,
+		cfg:          cfg,
+		view:         "recent",
+		detail:       map[string]Asset{},
+		ocr:          map[string]string{},
+		previewCache: map[string]string{},
+		input:        ti,
 	}
 }
 
@@ -345,6 +348,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status = "preview: " + msg.err.Error()
 		}
+		if msg.art != "" {
+			m.previewCache[m.previewKey(msg.id)] = msg.art
+		}
 		if a := m.selected(); a != nil && a.ID == msg.id {
 			m.preview = msg.art
 		}
@@ -381,118 +387,142 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
-		k := msg.String()
-
-		// typing in the input line
-		if m.inputUse != "" {
-			switch k {
-			case "esc":
-				m.stopInput()
-			case "enter":
-				return m, m.submitInput()
-			default:
+		// bubbletea groups a burst of printable keys (e.g. held "jjjjj" or
+		// fast typing) into ONE KeyMsg — split it so every keypress acts.
+		if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 {
+			var cmds []tea.Cmd
+			mm := m
+			for _, r := range msg.Runes {
 				var cmd tea.Cmd
-				m.input, cmd = m.input.Update(msg)
-				return m, cmd
+				mm, cmd = mm.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+				if cmd != nil {
+					cmds = append(cmds, cmd)
+				}
 			}
-			return m, nil
+			return mm, tea.Batch(cmds...)
 		}
+		return m.handleKey(msg)
+	}
+	return m, nil
+}
 
+// handleKey processes a single key press. Bursts of printable keys are
+// split by Update and routed here one rune at a time.
+func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
+	k := msg.String()
+	if os.Getenv("IMTUI_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[key %q cursor=%d assets=%d]\n", k, m.cursor, len(m.assets))
+	}
+
+	// typing in the input line
+	if m.inputUse != "" {
 		switch k {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		case "j", "down":
-			m.cursor++
-			return m, m.afterCursorMove()
-		case "k", "up":
-			m.cursor--
-			return m, m.afterCursorMove()
-		case "g", "home":
-			m.cursor = 0
-			return m, m.afterCursorMove()
-		case "G", "end":
-			m.cursor = 1 << 30
-			return m, m.afterCursorMove()
 		case "esc":
-			switch m.view {
-			case "person":
-				m.view = "people"
-				m.assets = nil
-				m.preview = ""
-				m.cursor = 0
-				m.nextCursor = ""
-				m.person = ""
-				m.context = ""
-				return m, m.loadPeople()
-			case "search", "people":
-				m.view = "recent"
-				m.assets = nil
-				m.preview = ""
-				m.nextCursor = ""
-				m.cursor = 0
-				m.context = ""
-				m.person = ""
-				return m, loadRecent(m.client)
-			}
-		case "p":
+			m.stopInput()
+		case "enter":
+			return m, m.submitInput()
+		default:
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	}
+
+	switch k {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "j", "down":
+		m.cursor++
+		return m, m.afterCursorMove()
+	case "k", "up":
+		m.cursor--
+		return m, m.afterCursorMove()
+	case "g", "home":
+		m.cursor = 0
+		return m, m.afterCursorMove()
+	case "G", "end":
+		m.cursor = 1 << 30
+		return m, m.afterCursorMove()
+	case "esc":
+		switch m.view {
+		case "person":
 			m.view = "people"
 			m.assets = nil
 			m.preview = ""
 			m.cursor = 0
 			m.nextCursor = ""
+			m.person = ""
 			m.context = ""
 			return m, m.loadPeople()
-		case "/":
-			m.startInput(inputSearch, "")
-		case "e":
-			if a := m.selected(); a != nil {
-				d := m.detail[a.ID]
-				cur := ""
-				if d.ExifInfo != nil {
-					cur = d.ExifInfo.Description
-				}
-				m.startInput(inputDesc, cur)
+		case "search", "people":
+			m.view = "recent"
+			m.assets = nil
+			m.preview = ""
+			m.nextCursor = ""
+			m.cursor = 0
+			m.context = ""
+			m.person = ""
+			return m, loadRecent(m.client)
+		}
+	case "p":
+		m.view = "people"
+		m.assets = nil
+		m.preview = ""
+		m.cursor = 0
+		m.nextCursor = ""
+		m.context = ""
+		return m, m.loadPeople()
+	case "/":
+		m.startInput(inputSearch, "")
+	case "e":
+		if a := m.selected(); a != nil {
+			d := m.detail[a.ID]
+			cur := ""
+			if d.ExifInfo != nil {
+				cur = d.ExifInfo.Description
 			}
-		case "r":
-			if m.view == "people" && m.cursor >= 0 && m.cursor < len(m.people) {
-				m.startInput(inputRename, m.people[m.cursor].Name)
-			}
+			m.startInput(inputDesc, cur)
+		}
+	case "r":
+		if m.view == "people" && m.cursor >= 0 && m.cursor < len(m.people) {
+			m.startInput(inputRename, m.people[m.cursor].Name)
+		}
 	case "enter":
-			if m.view == "people" && m.cursor >= 0 && m.cursor < len(m.people) {
-				p := m.people[m.cursor]
-				m.view = "person"
-				m.person = p.ID
-				m.context = "people named " + p.Name
-				m.assets = nil
-				m.preview = ""
-				m.nextCursor = ""
-				m.cursor = 0
-				return m, loadPerson(m.client, p.ID)
+		if m.view == "people" && m.cursor >= 0 && m.cursor < len(m.people) {
+			p := m.people[m.cursor]
+			m.view = "person"
+			m.person = p.ID
+			m.context = "people named " + p.Name
+			m.assets = nil
+			m.preview = ""
+			m.nextCursor = ""
+			m.cursor = 0
+			return m, loadPerson(m.client, p.ID)
+		}
+	case "s":
+		// search by image: find photos similar to the selected one
+		if a := m.selected(); a != nil {
+			return m, runSearch(m.client, "", a.ID, false,
+				"similar to "+a.OriginalFileName)
+		}
+	case "t":
+		if a := m.selected(); a != nil {
+			if t, ok := m.ocr[a.ID]; ok {
+				m.ocrShow = !m.ocrShow
+				_ = t
+			} else {
+				m.status = "reading text…"
+				return m, fetchOcr(m.client, a.ID)
 			}
-		case "s":
-			// search by image: find photos similar to the selected one
-			if a := m.selected(); a != nil {
-				return m, runSearch(m.client, "", a.ID, false,
-					"similar to "+a.OriginalFileName)
-			}
-		case "t":
-			if a := m.selected(); a != nil {
-				if t, ok := m.ocr[a.ID]; ok {
-					m.ocrShow = !m.ocrShow
-					_ = t
-				} else {
-					m.status = "reading text…"
-					return m, fetchOcr(m.client, a.ID)
-				}
-			}
-		case "o":
-			if a := m.selected(); a != nil {
-				url := m.client.base + "/photos/" + a.ID
-				if err := exec.Command("open", url).Start(); err != nil {
-					m.status = "cannot open browser: " + err.Error()
-				} else {
-					m.status = "opened in browser"
-				}
+		}
+	case "o":
+		if a := m.selected(); a != nil {
+			url := m.client.base + "/photos/" + a.ID
+			if err := exec.Command("open", url).Start(); err != nil {
+				m.status = "cannot open browser: " + err.Error()
+			} else {
+				m.status = "opened in browser"
 			}
 		}
 	}
@@ -501,13 +531,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // schedulePreview queues a debounced preview render for the selection and
 // returns the tick command that fires it (batched with a detail fetch).
+// If the art is already in the session cache it shows instantly instead.
 func (m *model) schedulePreview() tea.Cmd {
-	if a := m.selected(); a != nil {
-		m.pending = a.ID
-		return tea.Tick(300*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+	a := m.selected()
+	if a == nil {
+		m.pending = ""
+		return nil
 	}
-	m.pending = ""
-	return nil
+	if art, ok := m.previewCache[m.previewKey(a.ID)]; ok {
+		m.preview = art
+		m.pending = ""
+		if _, has := m.detail[a.ID]; !has {
+			return fetchDetail(m.client, a.ID)
+		}
+		return nil
+	}
+	m.pending = a.ID
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+// previewKey identifies a cached render: asset id + pane dimensions.
+func (m *model) previewKey(id string) string {
+	return fmt.Sprintf("%s:%dx%d", id, m.previewW(), m.previewH())
 }
 
 // afterCursorMove clamps the cursor, keeps the preview/debounce in sync, and
@@ -827,6 +872,7 @@ func (m model) visibleCount() int {
 func (m model) pendingBuckets() bool {
 	return len(m.assets) == 0 && (m.view == "recent" || m.view == "person")
 }
+
 // (infoPane removed — paneBlock handles the preview column now.)
 
 func personNames(a Asset) []string {
