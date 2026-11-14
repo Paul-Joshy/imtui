@@ -206,7 +206,8 @@ type model struct {
 	detail       map[string]Asset
 	ocr          map[string]string
 	ocrShow      bool
-	marked       map[string]bool // assets marked for copying (x)
+	prefill      string          // value pre-filled in the input (typing replaces it)
+	marked       map[string]bool // assets selected with space for copying
 
 	// input line
 	input    textinput.Model
@@ -546,6 +547,13 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 
 	// typing in the input line
 	if m.inputUse != "" {
+		// the first typed character replaces a pre-filled value (e.g. the
+		// copy destination default) instead of appending to it
+		if m.prefill != "" && m.input.Value() == m.prefill &&
+			(msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace) {
+			m.input.SetValue("")
+			m.prefill = ""
+		}
 		switch k {
 		case "ctrl+c":
 			return m, tea.Quit
@@ -667,15 +675,15 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 				return m, fetchOcr(m.client, a.ID)
 			}
 		}
-	case "x":
-		// mark/unmark the selected asset for copying
+	case " ":
+		// spacebar selects/unselects the asset for copying
 		if a := m.selected(); a != nil {
 			if m.marked[a.ID] {
 				delete(m.marked, a.ID)
 				m.status = ""
 			} else {
 				m.marked[a.ID] = true
-				m.status = fmt.Sprintf("marked (%d) — c to copy", len(m.marked))
+				m.status = fmt.Sprintf("selected %d — c to copy", len(m.marked))
 			}
 		}
 	case "c":
@@ -987,12 +995,14 @@ func (m *model) startInput(use inputUse, prefill string) {
 	m.input.SetValue(prefill)
 	m.input.Focus()
 	m.input.CursorEnd()
+	m.prefill = prefill
 }
 
 // stopInput unfocuses without submitting.
 func (m *model) stopInput() {
 	m.input.Blur()
 	m.inputUse = inputNone
+	m.prefill = ""
 }
 
 // submitInput dispatches the input line by purpose.
@@ -1443,7 +1453,7 @@ func (m model) footer() string {
 	hints := []struct{ k, v string }{
 		{"j/k", "move"}, {"/", "search"}, {"p", "people"},
 		{"s", "similar"}, {"e", "describe"}, {"t", "ocr"},
-		{"x", "mark"}, {"c", "copy"}, {"o", "open"}, {"q", "quit"},
+		{"space", "select"}, {"c", "copy"}, {"o", "open"}, {"q", "quit"},
 	}
 	if m.view == "people" {
 		hints = []struct{ k, v string }{

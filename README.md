@@ -27,7 +27,7 @@ browser.
 - **Proportionate previews** — the kitty placement is sized per photo
   (using the terminal's real cell pixel size when it can be queried), so
   portraits stay portrait; images are centered in the pane
-- **Copy out** — mark photos with `x`, press `c` to download the originals
+- **Copy out** — select photos with `space`, press `c` to download the originals
   (full resolution) into any folder, with your own or the Immich file names
 - **Search by context** — CLIP smart search: type what you're looking for
   ("dog on the beach", "screenshot", "birthday cake"); `ocr receipt`
@@ -54,8 +54,8 @@ browser.
 | `s` | find photos similar to the selected one |
 | `e` | edit description |
 | `t` | show OCR'd text |
-| `x` | mark/unmark the selected photo for copying (shown with `✓`) |
-| `c` | copy marked photos — or the selected one when nothing is marked — to a folder, at original full resolution. The prompt takes a folder (each file keeps its Immich name) or a path ending in a file name (that name; numbered variants when copying several). Existing files get ` (2)` suffixes |
+| `space` | select/unselect the photo for copying (shown with `✓`) |
+| `c` | copy selected photos — or the selected one when nothing is selected — to a folder, at original full resolution. The prompt takes a folder (each file keeps its Immich name) or a path ending in a file name (that name; numbered variants when copying several). Existing files get ` (2)` suffixes |
 | `o` | open in browser |
 | `esc` | back |
 | `q` | quit (`ctrl+c` works anywhere, even mid-input) |
