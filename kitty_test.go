@@ -37,10 +37,13 @@ func TestKittySequenceStructure(t *testing.T) {
 	if strings.Count(transmit, "\x1b_G") != strings.Count(transmit, "\x1b\\") {
 		t.Fatal("unbalanced APC blocks")
 	}
-	if !strings.HasPrefix(transmit, "\x1b_Ga=T,f=100,t=d,q=2,i=7,p=0,c=44,r=20,m=") {
-		t.Fatalf("bad first params: %q", transmit[:48])
+	if !strings.HasPrefix(transmit, "\x1b_Ga=T,f=100,t=d,q=2,i=7,p=1,c=44,r=20,C=1,m=") {
+		t.Fatalf("bad first params: %q", transmit[:52])
 	}
-	want := "\x1b_Ga=p,i=7,p=0,q=2,c=44,r=20\x1b\\"
+	if strings.Contains(transmit, "C=0") || !strings.Contains(transmit, "C=1") {
+		t.Fatal("transmit must pin the no-cursor-movement policy (C=1)")
+	}
+	want := "\x1b_Ga=p,i=7,p=1,q=2,c=44,r=20,C=1\x1b\\"
 	if place != want {
 		t.Fatalf("bad place seq: %q", place)
 	}
@@ -60,36 +63,48 @@ func TestSettleFreshPreview(t *testing.T) {
 		proto:   "kitty",
 		assets:  []Asset{{ID: id}},
 		cursor:  0,
-		freshID: id,
-		preview: "TRANSMIT+PLACE",
+		preview: "",
 		previewCache: map[string]cachedArt{
 			id + ":44x20": {art: "TRANSMIT+PLACE", place: "PLACE", fresh: true},
 		},
-		placeCache:  map[string]string{},
-		lastKittyID: kittyID(prev),
-		cfg:         Config{PreviewW: 44, PreviewH: 20},
+		placeCache: map[string]string{},
+		cfg:        Config{PreviewW: 44, PreviewH: 20},
 	}
-	m.width, m.height = 120, 34 // previewKey depends on the pane size
+	m.width, m.height = 120, 34
+
+	// display the previous image, then the new one — showArt appends the
+	// delete of the previous image and tracks the ids
+	m.lastKittyID = 0 // first display: nothing to delete
+	m.showArt(prev, "OLD")
+	if strings.Contains(m.preview, "a=d") {
+		t.Fatalf("first display must not delete: %q", m.preview)
+	}
+	m.showArt(id, "TRANSMIT+PLACE")
+	if !strings.HasSuffix(m.preview, kittyDelete(kittyIDFor(prev))) {
+		t.Fatalf("second display must delete the previous image: %q", m.preview)
+	}
+	if m.lastKittyID != kittyIDFor(id) || m.freshID != id {
+		t.Fatalf("state not tracked: lastKittyID=%d freshID=%q", m.lastKittyID, m.freshID)
+	}
 
 	// too soon: the transmit may not have been flushed yet
 	c := m.previewCache[m.previewKey(id)]
 	c.shownAt = time.Now()
 	m.previewCache[m.previewKey(id)] = c
 	m.settleFreshPreview()
-	if m.preview != "TRANSMIT+PLACE" {
+	if !strings.HasPrefix(m.preview, "TRANSMIT+PLACE") {
 		t.Fatalf("settled too early: preview = %q", m.preview)
 	}
 
-	// after the guard window: swap to place + delete the previous image
+	// after the guard window: swap to the cheap place sequence
 	c.shownAt = time.Now().Add(-100 * time.Millisecond)
 	m.previewCache[m.previewKey(id)] = c
 	m.settleFreshPreview()
-	want := "PLACE" + kittyDelete(kittyID(prev))
-	if m.preview != want {
-		t.Fatalf("settled preview:\n got %q\nwant %q", m.preview, want)
+	if m.preview != "PLACE" {
+		t.Fatalf("settled preview:\n got %q\nwant %q", m.preview, "PLACE")
 	}
-	if m.freshID != "" || m.lastKittyID != kittyID(id) {
-		t.Fatalf("state not updated: freshID=%q lastKittyID=%d", m.freshID, m.lastKittyID)
+	if m.freshID != "" {
+		t.Fatalf("freshID not cleared: %q", m.freshID)
 	}
 	if c := m.previewCache[m.previewKey(id)]; c.fresh || c.art != "PLACE" {
 		t.Fatalf("cache not downgraded: %+v", c)
@@ -97,11 +112,28 @@ func TestSettleFreshPreview(t *testing.T) {
 	if m.placeCache[m.previewKey(id)] != "PLACE" {
 		t.Fatal("placeCache missing after settle")
 	}
+}
 
-	// re-settling the same asset must not delete itself
-	m.settleFreshPreview()
-	if m.lastKittyID != kittyID(id) {
-		t.Fatalf("lastKittyID changed on re-settle: %d", m.lastKittyID)
+// showArt must chain deletes: displaying B after A removes A in the same
+// frame; re-displaying A re-places it without deleting B's id prematurely.
+func TestShowArtDeletesPrevious(t *testing.T) {
+	a, b, c := "aaaaaaaa", "bbbbbbbb", "cccccccc"
+	m := model{proto: "kitty"}
+	m.showArt(a, "A")
+	if strings.Contains(m.preview, "a=d") {
+		t.Fatalf("first display must not delete: %q", m.preview)
+	}
+	m.showArt(b, "B")
+	if !strings.HasSuffix(m.preview, kittyDelete(kittyIDFor(a))) {
+		t.Fatalf("second display must delete the first: %q", m.preview)
+	}
+	m.showArt(c, "C")
+	if !strings.HasSuffix(m.preview, kittyDelete(kittyIDFor(b))) {
+		t.Fatalf("third display must delete the second: %q", m.preview)
+	}
+	m.showArt(c, "C")
+	if strings.Contains(m.preview, "a=d") {
+		t.Fatalf("re-displaying the current image must not delete: %q", m.preview)
 	}
 }
 

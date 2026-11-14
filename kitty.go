@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	_ "image/jpeg"
 	_ "image/png"
@@ -34,12 +35,35 @@ const (
 	kittyCellH = 20
 )
 
-// kittyID derives a stable kitty image id from the asset id, so the disk
-// cache of encoded PNGs is keyed consistently across renders and sessions.
-func kittyID(assetID string) int {
+// kitty image ids must increase monotonically as new photos are displayed:
+// overlapping placements with the same z-index stack by id (higher id on
+// top), so a hash/random id would sometimes draw the NEW photo underneath
+// the old one until cleanup ran — an old→new swap the eye reads as tearing.
+// Ids are allocated per asset and reused for re-transmits/re-places.
+var (
+	kittyMu   sync.Mutex
+	kittyIDs  = map[string]int{}
+	kittyNext int
+)
+
+// kittyIDFor returns a stable, monotonically increasing kitty image id for
+// the asset id.
+func kittyIDFor(assetID string) int {
+	kittyMu.Lock()
+	defer kittyMu.Unlock()
+	if id, ok := kittyIDs[assetID]; ok {
+		return id
+	}
+	kittyNext++
+	kittyIDs[assetID] = kittyNext
+	return kittyNext
+}
+
+// fnv32a hashes s for cache file naming (stable across sessions).
+func fnv32a(s string) uint32 {
 	h := fnv.New32a()
-	h.Write([]byte(assetID))
-	return int(h.Sum32()&0x3fffffff) + 1
+	h.Write([]byte(s))
+	return h.Sum32()
 }
 
 // kittyDelete returns the sequence that deletes the image with the given id
@@ -90,9 +114,17 @@ func detectImageProtocol(cfg Config) string {
 // uploaded image on later frames). The image is drawn over cols×rows cells
 // starting at the terminal cursor. Encoded PNGs are cached on disk so each
 // asset is resized/encoded once per session's pane size.
+//
+// The sequence parameters matter for rendering stability inside tmux:
+//   - C=1: kitty must not move the cursor after display (default C=0 moves
+//     it right/down by the image size, which tmux does not track through
+//     passthrough — subsequent output lands rows away = screen tearing).
+//   - p=1: a fixed placement id, so re-placing replaces the placement
+//     instead of stacking a new one (p=0 auto-assigns a fresh id each time).
+//   - q=2: no responses back from the terminal.
 func kittyImageSequence(path string, cols, rows, id int) (transmit, place string, err error) {
 	var pngBytes []byte
-	cache := expand(fmt.Sprintf("~/.cache/imtui/kitty/%d_%dx%d.png", id, cols, rows))
+	cache := expand(fmt.Sprintf("~/.cache/imtui/kitty/%d_%dx%d.png", fnv32a(path), cols, rows))
 	if b, err := os.ReadFile(cache); err == nil {
 		pngBytes = b
 	} else {
@@ -134,9 +166,9 @@ func kittyImageSequence(path string, cols, rows, id int) (transmit, place string
 		var params string
 		switch {
 		case first && last:
-			params = fmt.Sprintf("a=T,f=100,t=d,q=2,i=%d,p=0,c=%d,r=%d,m=0", id, cols, rows)
+			params = fmt.Sprintf("a=T,f=100,t=d,q=2,i=%d,p=1,c=%d,r=%d,C=1,m=0", id, cols, rows)
 		case first:
-			params = fmt.Sprintf("a=T,f=100,t=d,q=2,i=%d,p=0,c=%d,r=%d,m=1", id, cols, rows)
+			params = fmt.Sprintf("a=T,f=100,t=d,q=2,i=%d,p=1,c=%d,r=%d,C=1,m=1", id, cols, rows)
 		case last:
 			params = "m=0"
 		default:
@@ -146,7 +178,7 @@ func kittyImageSequence(path string, cols, rows, id int) (transmit, place string
 		sent = end
 	}
 	transmit = sb.String()
-	place = fmt.Sprintf("\x1b_Ga=p,i=%d,p=0,q=2,c=%d,r=%d\x1b\\", id, cols, rows)
+	place = fmt.Sprintf("\x1b_Ga=p,i=%d,p=1,q=2,c=%d,r=%d,C=1\x1b\\", id, cols, rows)
 	return transmit, place, nil
 }
 

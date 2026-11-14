@@ -180,6 +180,7 @@ type model struct {
 	placeCache   map[string]string // "id:WxH" -> cheap re-place sequence (after first draw)
 	freshID      string            // asset whose preview still contains the transmit
 	lastKittyID  int               // kitty image id of the image currently on screen
+	lastShow     time.Time         // when the last kitty art was displayed (burst throttle)
 	detail       map[string]Asset
 	ocr          map[string]string
 	ocrShow      bool
@@ -278,7 +279,7 @@ func renderPreview(c *Client, id string, cols, rows int, proto string) tea.Cmd {
 			return previewMsg{id: id, err: err}
 		}
 		if proto == "kitty" {
-			transmit, place, err := kittyImageSequence(path, cols, rows, kittyID(id))
+			transmit, place, err := kittyImageSequence(path, cols, rows, kittyIDFor(id))
 			if err != nil {
 				return previewMsg{id: id, err: err}
 			}
@@ -413,8 +414,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if a := m.selected(); a != nil && a.ID == msg.id && msg.art != "" {
-			m.preview = msg.art
-			m.freshID = msg.id
+			m.showArt(msg.id, msg.art)
 			// pre-render the rows above/below so scrolling hits the cache
 			return m, m.preRenderNeighbors()
 		}
@@ -604,13 +604,30 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 	return m, nil
 }
 
+// showArt makes art the visible preview for the asset. Any previously
+// displayed image is deleted in the same frame, after the new art — so
+// during fast scrolling exactly one image stays on screen and the new one
+// is already on top (monotonic ids) before the old goes away: no flash.
+// Lowercase d=i removes placements but keeps the image data, so scrolling
+// back to a shown asset can still re-place it from placeCache without a
+// re-transmit.
+func (m *model) showArt(id, art string) {
+	kid := kittyIDFor(id)
+	if m.lastKittyID != 0 && m.lastKittyID != kid {
+		art += kittyDelete(m.lastKittyID)
+	}
+	m.preview = art
+	m.lastKittyID = kid
+	m.freshID = id
+	m.lastShow = time.Now()
+}
+
 // settleFreshPreview runs at the start of every Update: when the selected
 // asset's preview still carries the full kitty transmit and has been on
 // screen long enough to have been flushed to the terminal, it swaps the view
-// to the cheap re-place sequence (plus a delete of the previously displayed
-// image, so old graphics don't stack up underneath). The swap changes the
-// rendered row, so the next redraw executes the sequences — ~30 bytes
-// instead of re-sending ~230KB on every subsequent frame.
+// to the cheap re-place sequence. The swap changes the rendered row, so the
+// next redraw executes it — ~30 bytes instead of re-sending ~230KB on
+// every subsequent frame.
 func (m *model) settleFreshPreview() {
 	if m.proto != "kitty" || m.freshID == "" {
 		return
@@ -630,16 +647,11 @@ func (m *model) settleFreshPreview() {
 	if time.Since(c.shownAt) < 50*time.Millisecond {
 		return
 	}
-	seq := c.place
-	if m.lastKittyID != 0 && m.lastKittyID != kittyID(a.ID) {
-		seq += kittyDelete(m.lastKittyID)
-	}
-	m.preview = seq
+	m.preview = c.place
 	c.art = c.place // cache now serves the cheap sequence too
 	c.fresh = false
 	m.previewCache[key] = c
 	m.placeCache[key] = c.place
-	m.lastKittyID = kittyID(a.ID)
 	m.freshID = ""
 }
 
@@ -655,7 +667,7 @@ func (m *model) schedulePreview() tea.Cmd {
 	key := m.previewKey(a.ID)
 	if place, ok := m.placeCache[key]; ok {
 		// drawn before: the image is already uploaded to the terminal
-		m.preview = place
+		m.showArt(a.ID, place)
 		m.pending = ""
 		if _, has := m.detail[a.ID]; !has {
 			return fetchDetail(m.client, a.ID)
@@ -669,8 +681,13 @@ func (m *model) schedulePreview() tea.Cmd {
 			c.shownAt = time.Now()
 			m.previewCache[key] = c
 		}
-		m.preview = c.art
-		m.freshID = a.ID
+		if time.Since(m.lastShow) < 120*time.Millisecond {
+			// scrolling fast: don't stream ~230KB per step through tmux —
+			// collapse the burst into one transmit when the keys pause.
+			m.pending = a.ID
+			return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+		}
+		m.showArt(a.ID, c.art)
 		m.pending = ""
 		return fetchDetailIfMissing(m, a.ID)
 	}
@@ -1076,6 +1093,18 @@ func wordWrap(s string, w int) string {
 }
 
 func (m model) peopleList() string {
+	// The people view has no image rows, but a kitty image from the asset
+	// view may still be placed on screen — and graphics draw *above* text.
+	// Emit an idempotent delete on the first line so it can't cover the
+	// list (re-deleting a gone image is a no-op; data is kept so scrolling
+	// back to assets can re-place it from the cache).
+	if m.proto == "kitty" && m.lastKittyID != 0 {
+		return kittyDelete(m.lastKittyID) + "\n" + m.peopleRows()
+	}
+	return m.peopleRows()
+}
+
+func (m model) peopleRows() string {
 	if len(m.people) == 0 {
 		return dimStyle.Render("loading… (or no people detected yet)")
 	}
