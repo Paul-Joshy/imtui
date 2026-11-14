@@ -194,8 +194,15 @@ func (c *Client) UpdateDescription(id, desc string) error {
 	return err
 }
 
-// OcrText fetches the OCR text boxes of an asset and joins them.
+// OcrText fetches the OCR text boxes of an asset and joins them with " · "
+// (for display).
 func (c *Client) OcrText(id string) (string, error) {
+	t, err := c.ocrJoined(id, " · ")
+	return t, err
+}
+
+// ocrJoined fetches the OCR text boxes of an asset and joins their text.
+func (c *Client) ocrJoined(id, sep string) (string, error) {
 	b, err := c.do("GET", "/assets/"+id+"/ocr", nil)
 	if err != nil {
 		return "", err
@@ -212,7 +219,63 @@ func (c *Client) OcrText(id string) (string, error) {
 			parts = append(parts, t)
 		}
 	}
-	return strings.Join(parts, " · "), nil
+	return strings.Join(parts, sep), nil
+}
+
+// OcrGrep greps the OCR'd text across the library: candidates come from the
+// server's metadata ocr filter (a fast case-insensitive match), then each
+// candidate's actual OCR text is fetched and checked, so the result is an
+// exact substring match on the real text — grep semantics, not the fuzzy
+// ML search. maxCandidates caps how many candidates get verified.
+func (c *Client) OcrGrep(term string, maxCandidates int) ([]Asset, error) {
+	b, err := c.do("POST", "/search/metadata", map[string]any{"ocr": term, "size": 1000})
+	if err != nil {
+		return nil, err
+	}
+	var sr searchResponse
+	if err := json.Unmarshal(b, &sr); err != nil {
+		return nil, err
+	}
+	cands := sr.Assets.Items
+	if len(cands) > maxCandidates {
+		cands = cands[:maxCandidates]
+	}
+	needle := strings.ToLower(term)
+	// verify candidates concurrently — each OCR fetch is a separate request
+	type hit struct {
+		i int
+		a Asset
+	}
+	hits := make(chan hit, len(cands))
+	sem := make(chan struct{}, 8)
+	for i, a := range cands {
+		go func(i int, a Asset) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			t, err := c.ocrJoined(a.ID, " ")
+			if err == nil && strings.Contains(strings.ToLower(t), needle) {
+				hits <- hit{i, a}
+			} else {
+				hits <- hit{i, Asset{}}
+			}
+		}(i, a)
+	}
+	out := make([]Asset, len(cands))
+	n := 0
+	for range cands {
+		h := <-hits
+		if h.a.ID != "" {
+			out[h.i] = h.a
+			n++
+		}
+	}
+	res := make([]Asset, 0, n)
+	for _, a := range out {
+		if a.ID != "" {
+			res = append(res, a)
+		}
+	}
+	return res, nil
 }
 
 func (c *Client) People() ([]PersonFull, error) {

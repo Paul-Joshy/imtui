@@ -30,8 +30,9 @@ browser.
 - **Copy out** — select photos with `space`, press `c` to download the originals
   (full resolution) into any folder, with your own or the Immich file names
 - **Search by context** — CLIP smart search: type what you're looking for
-  ("dog on the beach", "screenshot", "birthday cake"); `ocr receipt`
-  restricts the search to text Immich read inside photos
+  ("dog on the beach", "screenshot", "birthday cake"). `ocr <text>` instead
+  greps the exact text Immich read *inside* photos (case-insensitive
+  substring, like grep)
 - **Contextual keybindings** — `/` searches photos from asset lists but
   searches people by name from the people view (empty submit restores the
   full list)
@@ -49,13 +50,13 @@ browser.
 | Key | Action |
 | --- | --- |
 | `j` / `k` | move (vim-style), `g`/`G` top/bottom |
-| `/` | search — photos from asset lists, people *by name* from the people view (prefix `ocr ` searches text inside photos) |
+| `/` | search — photos from asset lists, people *by name* from the people view. Prefix `ocr <text>` greps the text recognized *inside* photos (exact substring, like grep); a plain query is the fuzzy context search |
 | `p` | people list · `enter` browse · `r` rename person |
 | `s` | find photos similar to the selected one |
 | `e` | edit description |
 | `t` | show OCR'd text |
 | `space` | select/unselect the photo for copying (shown with `✓`) |
-| `c` | copy selected photos — or the selected one when nothing is selected — to a folder, at original full resolution. The prompt takes a folder (each file keeps its Immich name) or a path ending in a file name (that name; numbered variants when copying several). Existing files get ` (2)` suffixes |
+| `c` | copy selected photos — or the selected one when nothing is selected — to a folder, at original full resolution. The prompt takes a folder (each file keeps its Immich name) or a path ending in a file name (that name; numbered variants when copying several). Existing files get ` (2)` suffixes. `tab` completes folder and file names from the filesystem |
 | `o` | open in browser |
 | `esc` | back |
 | `q` | quit (`ctrl+c` works anywhere, even mid-input) |

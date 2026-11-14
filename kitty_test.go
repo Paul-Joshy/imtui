@@ -6,9 +6,12 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // findCachedThumb picks a real JPEG from the disk cache to test with.
@@ -255,5 +258,95 @@ func TestTmuxPassthrough(t *testing.T) {
 	plain := "\x1b[31mhello\x1b[0m"
 	if got := wrapTmuxAPC(plain); got != plain {
 		t.Fatalf("plain text mangled: %q", got)
+	}
+}
+
+func TestCompleteCopyPath(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "beach-day"), 0o755)
+	os.WriteFile(filepath.Join(dir, "beach-day.jpg"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(dir, "BeachTrip.png"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(dir, ".hidden"), []byte("x"), 0o644)
+
+	// unique match, case-insensitive ("beacht" only matches BeachTrip.png)
+	got, n, names, err := completeCopyPath(dir + "/beacht")
+	if err != nil || n != 1 || names != nil {
+		t.Fatalf("unique: n=%d names=%v err=%v", n, names, err)
+	}
+	if want := dir + "/BeachTrip.png"; got != want {
+		t.Fatalf("unique match: got %q want %q", got, want)
+	}
+
+	// no match for a prefix nothing shares
+	if _, n, names, _ = completeCopyPath(dir + "/zzz"); n != 0 || names != nil {
+		t.Fatalf("no match: n=%d names=%v", n, names)
+	}
+
+	// directory name completes with trailing slash
+	os.MkdirAll(filepath.Join(dir, "trips"), 0o755)
+	got, n, _, _ = completeCopyPath(dir + "/tr")
+	if n != 1 || got != dir+"/trips/" {
+		t.Fatalf("dir match: n=%d got %q", n, got)
+	}
+
+	// several matches: no common prefix beyond the typed part → list
+	got, n, names, _ = completeCopyPath(dir + "/bea")
+	if got != dir+"/bea" || n != 3 || names == nil {
+		t.Fatalf("multi: got %q n=%d names=%v", got, n, names)
+	}
+	if len(names) != 3 || names[0] != "BeachTrip.png" || names[1] != "beach-day/" || names[2] != "beach-day.jpg" {
+		t.Fatalf("multi names: %v", names)
+	}
+
+	// common prefix longer than typed part completes to the prefix
+	os.MkdirAll(filepath.Join(dir, "vacation"), 0o755)
+	os.WriteFile(filepath.Join(dir, "vacation-2026.jpg"), []byte("x"), 0o644)
+	got, n, names, _ = completeCopyPath(dir + "/va")
+	if n != 2 || names != nil || got != dir+"/vacation" {
+		t.Fatalf("prefix: got %q n=%d names=%v", got, n, names)
+	}
+
+	// hidden files only when the typed part starts with "."
+	got, n, _, _ = completeCopyPath(dir + "/.")
+	if n != 1 || got != dir+"/.hidden" {
+		t.Fatalf("hidden: n=%d got %q", n, got)
+	}
+
+	// no match
+	if _, n, names, _ = completeCopyPath(dir + "/zzz"); n != 0 || names != nil {
+		t.Fatalf("no match: n=%d names=%v", n, names)
+	}
+
+	// no partial name: lists the whole directory
+	_, n, names, _ = completeCopyPath(dir + "/")
+	if n < 4 || names == nil {
+		t.Fatalf("dir listing: n=%d names=%v", n, names)
+	}
+}
+
+func TestTabCompletesCopyInput(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "Desktop"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "Desktop", "birthday"), 0o755)
+	old, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(old)
+
+	m := initialModel(nil, Config{})
+	m.startInput(inputCopy, "")
+	m.input.SetValue("Desk")
+
+	var out model
+	out, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	if got := out.input.Value(); got != "Desktop/" {
+		t.Fatalf("after tab: got %q want %q", got, "Desktop/")
+	}
+	// tab again: the completed directory has a single visible entry
+	// (birthday), so it completes into it
+	out, _ = out.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	if got := out.input.Value(); got != "Desktop/birthday/" {
+		t.Fatalf("second tab: got %q want %q", got, "Desktop/birthday/")
 	}
 }

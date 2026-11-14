@@ -1,8 +1,8 @@
 // imtui — a minimal Immich client for the terminal.
 //
-// Browse recent photos, search by context (CLIP), by OCR'd text, or BY an
-// image; browse and rename people; edit photo descriptions. Previews render
-// through chafa.
+// Browse recent photos, search by context (CLIP), grep the OCR'd text of
+// photos, or search BY an image; browse and rename people; edit photo
+// descriptions. Previews render through chafa.
 //
 // Keys: j/k move · / search · p people · s similar (search by image) ·
 //
@@ -264,6 +264,23 @@ func runSearch(c *Client, query, assetID string, ocr bool, context string) tea.C
 	return func() tea.Msg {
 		assets, total, err := c.SmartSearch(query, assetID, ocr, 100)
 		return resultsMsg{assets: assets, total: total, context: context, search: true, err: err}
+	}
+}
+
+// runOcrGrep greps the OCR'd text for an exact substring and wraps the
+// verified matches into a resultsMsg command.
+func runOcrGrep(c *Client, term string) tea.Cmd {
+	return func() tea.Msg {
+		assets, err := c.OcrGrep(term, 1000)
+		if err != nil {
+			return resultsMsg{err: err}
+		}
+		return resultsMsg{
+			assets:  assets,
+			total:   len(assets),
+			context: fmt.Sprintf("grep %q in OCR text", term),
+			search:  true,
+		}
 	}
 }
 
@@ -559,7 +576,18 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 			return m, tea.Quit
 		case "esc":
 			m.stopInput()
+		case "tab":
+			// complete the copy destination from the filesystem
+			if m.inputUse == inputCopy {
+				m.status = m.completeCopy()
+				if os.Getenv("IMTUI_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "[tab value=%q status=%q]\n", m.input.Value(), m.status)
+				}
+			}
 		case "enter":
+			if strings.HasPrefix(strings.TrimSpace(m.input.Value()), "ocr ") {
+				m.status = "grepping OCR text…"
+			}
 			return m, m.submitInput()
 		case "q":
 			// an empty input line is never what you wanted — q dismisses it
@@ -711,6 +739,99 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 // a file extension is an explicit file name (numbered variants when
 // copying several); anything else is the target folder and each asset
 // keeps its original name.
+// completeCopy completes the copy destination from the filesystem: it reads
+// the directory in the value's last path component and matches the partial
+// name after the last "/" (case-insensitive, hidden files only when the
+// typed part starts with "."). One match completes it, "/" appended for
+// directories; several complete to the longest common prefix; the rest are
+// listed in the status line. Returns the new input value.
+func (m *model) completeCopy() string {
+	value := m.input.Value()
+	completed, n, names, err := completeCopyPath(value)
+	switch {
+	case err != nil:
+		return "cannot read: " + err.Error()
+	case n == 0 && names == nil:
+		return "no match"
+	}
+	if completed != value {
+		m.input.SetValue(completed)
+		m.input.CursorEnd()
+	}
+	switch {
+	case n == 1 && names == nil:
+		return ""
+	case names != nil:
+		if len(names) > 5 {
+			names = append(names[:5], "…")
+		}
+		return fmt.Sprintf("%d matches: %s", n, strings.Join(names, "  "))
+	default:
+		return fmt.Sprintf("%d matches (prefix)", n)
+	}
+}
+
+func completeCopyPath(value string) (completed string, n int, names []string, err error) {
+	dir, part := "", value
+	if i := strings.LastIndex(value, "/"); i >= 0 {
+		dir, part = value[:i+1], value[i+1:]
+	}
+	realDir := dir
+	if realDir == "" {
+		realDir = "."
+	}
+	if e := expand(realDir); e != "" {
+		realDir = e
+	}
+	entries, err := os.ReadDir(realDir)
+	if err != nil {
+		return value, 0, nil, err
+	}
+	low := strings.ToLower(part)
+	matches := []os.DirEntry{}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(part, ".") {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(name), low) {
+			matches = append(matches, e)
+		}
+	}
+	if len(matches) == 0 {
+		return value, 0, nil, nil
+	}
+	if len(matches) == 1 {
+		name := matches[0].Name()
+		if matches[0].IsDir() {
+			name += "/"
+		}
+		return dir + name, 1, nil, nil
+	}
+	// several matches: extend to the longest common prefix when that is
+	// longer than what was typed
+	prefix := matches[0].Name()
+	for _, e := range matches[1:] {
+		name := e.Name()
+		i := 0
+		for i < len(prefix) && i < len(name) && prefix[i] == name[i] {
+			i++
+		}
+		prefix = prefix[:i]
+	}
+	if len(prefix) > len(part) {
+		return dir + prefix, len(matches), nil, nil
+	}
+	for _, e := range matches {
+		name := e.Name()
+		if e.IsDir() {
+			name += "/"
+		}
+		names = append(names, name)
+	}
+	return value, len(matches), names, nil
+}
+
 func runCopy(m *model, dest string) tea.Cmd {
 	ids := []Asset{}
 	for _, a := range m.assets {
@@ -1015,9 +1136,9 @@ func (m *model) submitInput() tea.Cmd {
 		if val == "" {
 			return nil
 		}
-		// "ocr <query>" restricts the search to OCR'd text
+		// "ocr <query>" greps the OCR'd text (exact substring match)
 		if rest, ok := strings.CutPrefix(val, "ocr "); ok && rest != "" {
-			return runSearch(m.client, rest, "", true, "OCR text “"+rest+"”")
+			return runOcrGrep(m.client, rest)
 		}
 		return runSearch(m.client, val, "", false, "search “"+val+"”")
 	case inputName:
