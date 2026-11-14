@@ -25,13 +25,17 @@ browser.
   library is local, renders are cached in memory and on disk, and neighbors
   are pre-rendered as you move
 - **Search by context** — CLIP smart search: type what you're looking for
-  ("dog on the beach", "screenshot", "birthday cake")
+  ("dog on the beach", "screenshot", "birthday cake"); `ocr receipt`
+  restricts the search to text Immich read inside photos
+- **Contextual keybindings** — `/` searches photos from asset lists but
+  searches people by name from the people view (empty submit restores the
+  full list)
 - **Search by image** — press `s` on any photo to find visually similar ones
 - **Search OCR'd text** — Immich reads text inside photos; `ocr receipt`
   finds photos containing that text. Press `t` to read the text of the
   selected photo
-- **People** — browse everyone Immich has detected, view their photos, and
-  rename people (press `r`)
+- **People** — browse everyone Immich has detected, search their names
+  (`/`), view their photos, and rename people (press `r`)
 - **Descriptions** — press `e` to write/edit a photo's description
 - **Open in browser** — `o` opens the asset in the Immich web app
 
@@ -40,7 +44,7 @@ browser.
 | Key | Action |
 | --- | --- |
 | `j` / `k` | move (vim-style), `g`/`G` top/bottom |
-| `/` | search (prefix with `ocr ` to search text inside photos) |
+| `/` | search — photos from asset lists, people *by name* from the people view (prefix `ocr ` searches text inside photos) |
 | `p` | people list · `enter` browse · `r` rename person |
 | `s` | find photos similar to the selected one |
 | `e` | edit description |

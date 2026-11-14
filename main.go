@@ -143,6 +143,7 @@ type inputUse string
 const (
 	inputNone   inputUse = ""
 	inputSearch inputUse = "search"
+	inputName   inputUse = "namesearch"
 	inputDesc   inputUse = "description"
 	inputRename inputUse = "rename"
 )
@@ -446,8 +447,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.people = msg.people
 		m.cursor = 0
+		m.context = msg.context // empty = full list (resets any name filter)
+		m.status = ""
 		if len(msg.people) == 0 {
-			m.status = "no people detected yet"
+			if msg.context != "" {
+				m.status = "no matching people"
+			} else {
+				m.status = "no people detected yet"
+			}
 		}
 
 	case tea.KeyMsg:
@@ -549,7 +556,13 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.context = ""
 		return m, m.loadPeople()
 	case "/":
-		m.startInput(inputSearch, "")
+		// contextual: search people by name from the people view,
+		// otherwise run the photo (CLIP/OCR) search
+		if m.view == "people" {
+			m.startInput(inputName, "")
+		} else {
+			m.startInput(inputSearch, "")
+		}
 	case "e":
 		if a := m.selected(); a != nil {
 			d := m.detail[a.ID]
@@ -778,6 +791,9 @@ func (m *model) startInput(use inputUse, prefill string) {
 	case inputSearch:
 		m.input.Placeholder = "describe what you're looking for…"
 		m.input.Prompt = "search: "
+	case inputName:
+		m.input.Placeholder = "who are you looking for…"
+		m.input.Prompt = "names: "
 	case inputDesc:
 		m.input.Placeholder = "what's in this photo?"
 		m.input.Prompt = "description: "
@@ -811,6 +827,12 @@ func (m *model) submitInput() tea.Cmd {
 			return runSearch(m.client, rest, "", true, "OCR text “"+rest+"”")
 		}
 		return runSearch(m.client, val, "", false, "search “"+val+"”")
+	case inputName:
+		if val == "" {
+			// empty: back to the full people list
+			return m.loadPeople()
+		}
+		return runPeopleSearch(m.client, val)
 	case inputDesc:
 		if a := m.selected(); a != nil {
 			return saveDescription(m.client, a.ID, val)
@@ -833,9 +855,22 @@ func (m model) loadPeople() tea.Cmd {
 	}
 }
 
+// runPeopleSearch narrows the people list to those whose name matches.
+func runPeopleSearch(c *Client, name string) tea.Cmd {
+	return func() tea.Msg {
+		ps, err := c.SearchPeople(name)
+		return peopleMsg{
+			people:  ps,
+			context: "people matching “" + name + "”",
+			err:     err,
+		}
+	}
+}
+
 type peopleMsg struct {
-	people []PersonFull
-	err    error
+	people  []PersonFull
+	context string
+	err     error
 }
 
 // ---------- sizing ----------
@@ -1191,7 +1226,7 @@ func (m model) footer() string {
 	}
 	if m.view == "people" {
 		hints = []struct{ k, v string }{
-			{"j/k", "move"}, {"enter", "browse"}, {"r", "name"}, {"q", "quit"},
+			{"j/k", "move"}, {"/", "names"}, {"enter", "browse"}, {"r", "name"}, {"q", "quit"},
 		}
 	}
 	parts := []string{}

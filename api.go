@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -225,6 +226,20 @@ func (c *Client) People() ([]PersonFull, error) {
 		return nil, err
 	}
 	return r.People, nil
+}
+
+// SearchPeople finds people by (fuzzy) name match via Immich's search
+// endpoint. The result set can be empty (no matches), which is not an error.
+func (c *Client) SearchPeople(name string) ([]PersonFull, error) {
+	b, err := c.do("GET", "/search/person?name="+url.QueryEscape(name)+"&withHidden=false", nil)
+	if err != nil {
+		return nil, err
+	}
+	var people []PersonFull
+	if err := json.Unmarshal(b, &people); err != nil {
+		return nil, err
+	}
+	return people, nil
 }
 
 // RenamePerson sets a person's name (Immich then re-labels their faces).
