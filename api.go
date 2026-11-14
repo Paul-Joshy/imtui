@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -271,6 +272,31 @@ func (c *Client) MetadataSearch(personIDs []string, cursor string, newestFirst b
 		return nil, "", err
 	}
 	return sr.Assets.Items, sr.Assets.NextCursor, nil
+}
+
+// Original downloads the asset's original file (full resolution, original
+// format) to dest, streaming so large videos don't buffer in memory.
+func (c *Client) Original(id, dest string) error {
+	req, err := http.NewRequest("GET", c.base+"/api/assets/"+id+"/original", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("x-api-key", c.key)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("GET original: %s", resp.Status)
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
 }
 
 // Thumbnail downloads a preview thumbnail to path (no-op if cached).

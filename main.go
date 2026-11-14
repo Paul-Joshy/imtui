@@ -11,8 +11,10 @@ package main
 
 import (
 	"fmt"
+	"image"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,6 +40,9 @@ func main() {
 
 	m := initialModel(c, cfg)
 	m.proto = detectImageProtocol(cfg)
+	if m.proto == "kitty" {
+		queryCellSize() // real cell pixel size → exact photo proportions
+	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "imtui:", err)
@@ -54,6 +59,7 @@ type Config struct {
 	PreviewH      int    `toml:"preview_height"`
 	ImageProtocol string `toml:"image_protocol"` // auto | kitty | symbols
 	ThumbsDir     string `toml:"thumbs_dir"`     // Immich library/thumbs for direct disk reads
+	CopyDir       string `toml:"copy_dir"`       // default destination for copying originals (c)
 }
 
 const configPath = "~/.config/imtui/config.toml"
@@ -124,6 +130,8 @@ type previewMsg struct {
 	id    string
 	art   string
 	place string // kitty: cheap re-place sequence for later frames
+	cols  int    // kitty: placement width in cells (aspect-fitted)
+	rows  int    // kitty: placement height in cells
 	err   error
 }
 
@@ -134,6 +142,12 @@ type ocrMsg struct {
 }
 
 type savedMsg struct{ err error }
+
+type copiedMsg struct {
+	n   int
+	dir string
+	err error
+}
 
 // ---------- model ----------
 
@@ -146,6 +160,7 @@ const (
 	inputName   inputUse = "namesearch"
 	inputDesc   inputUse = "description"
 	inputRename inputUse = "rename"
+	inputCopy   inputUse = "copy"
 )
 
 // cachedArt is a rendered preview: art is what's drawn first (symbols ANSI
@@ -153,11 +168,15 @@ const (
 // later frames (symbols mode leaves it empty — art is reused as-is).
 // fresh means art still carries the full transmit that has not been
 // swapped for place yet; shownAt is when it became the visible preview.
+// cols/rows are the kitty placement's cell size (aspect-fitted per photo;
+// zero for symbols mode).
 type cachedArt struct {
 	art     string
 	place   string
 	fresh   bool
 	shownAt time.Time
+	cols    int
+	rows    int
 }
 
 type model struct {
@@ -176,6 +195,8 @@ type model struct {
 
 	cursor       int
 	preview      string // art of the selected asset (ANSI or kitty sequences)
+	previewCols  int    // kitty: placement width in cells of the shown preview
+	previewRows  int    // kitty: placement height in cells of the shown preview
 	pending      string // asset id queued for preview render
 	previewCache map[string]cachedArt
 	placeCache   map[string]string // "id:WxH" -> cheap re-place sequence (after first draw)
@@ -185,6 +206,7 @@ type model struct {
 	detail       map[string]Asset
 	ocr          map[string]string
 	ocrShow      bool
+	marked       map[string]bool // assets marked for copying (x)
 
 	// input line
 	input    textinput.Model
@@ -209,6 +231,7 @@ func initialModel(c *Client, cfg Config) model {
 		ocr:          map[string]string{},
 		previewCache: map[string]cachedArt{},
 		placeCache:   map[string]string{},
+		marked:       map[string]bool{},
 		input:        ti,
 	}
 }
@@ -280,6 +303,10 @@ func renderPreview(c *Client, id string, cols, rows int, proto string) tea.Cmd {
 			return previewMsg{id: id, err: err}
 		}
 		if proto == "kitty" {
+			// fit the placement to the photo's own aspect ratio: search
+			// the largest cell rect whose pixel size matches the image,
+			// then resize the bitmap 1:1 onto those cells
+			cols, rows = fitPreviewCells(path, cols, rows)
 			transmit, place, err := kittyImageSequence(path, cols, rows, kittyIDFor(id))
 			if err != nil {
 				return previewMsg{id: id, err: err}
@@ -290,6 +317,8 @@ func renderPreview(c *Client, id string, cols, rows int, proto string) tea.Cmd {
 				id:    id,
 				art:   wrapTmuxAPC(transmit + place),
 				place: wrapTmuxAPC(place),
+				cols:  cols,
+				rows:  rows,
 			}
 		}
 		out, err := exec.Command("chafa",
@@ -306,6 +335,19 @@ func renderPreview(c *Client, id string, cols, rows int, proto string) tea.Cmd {
 		art := strings.NewReplacer("\x1b[?25l", "", "\x1b[?25h", "").Replace(string(out))
 		return previewMsg{id: id, art: art}
 	}
+}
+
+// fitPreviewCells reads the image dimensions (header only) and fits a
+// cell rect preserving the photo's proportions within the pane budget.
+func fitPreviewCells(path string, bw, bh int) (cols, rows int) {
+	A := 1.0
+	if f, err := os.Open(path); err == nil {
+		if cfg, _, e := image.DecodeConfig(f); e == nil && cfg.Width > 0 && cfg.Height > 0 {
+			A = float64(cfg.Width) / float64(cfg.Height)
+		}
+		f.Close()
+	}
+	return fitCells(A, bw, bh)
 }
 
 func saveDescription(c *Client, id, desc string) tea.Cmd {
@@ -373,9 +415,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.assets = msg.assets
 			m.cursor = 0
 			m.preview = ""
+			m.previewCols, m.previewRows = 0, 0
 			m.freshID = ""
 			m.loadingMore = false
 			m.ocrShow = false
+			m.marked = map[string]bool{} // a new list invalidates old marks
 			if msg.context != "" {
 				m.context = msg.context
 			}
@@ -412,10 +456,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				place:   msg.place,
 				fresh:   m.proto == "kitty",
 				shownAt: time.Now(),
+				cols:    msg.cols,
+				rows:    msg.rows,
 			}
 		}
 		if a := m.selected(); a != nil && a.ID == msg.id && msg.art != "" {
-			m.showArt(msg.id, msg.art)
+			m.showArt(msg.id, msg.art, msg.cols, msg.rows)
 			// pre-render the rows above/below so scrolling hits the cache
 			return m, m.preRenderNeighbors()
 		}
@@ -428,6 +474,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ocr[msg.id] = msg.text
 		m.ocrShow = true
 		m.status = ""
+
+	case copiedMsg:
+		if msg.err != nil {
+			m.status = fmt.Sprintf("copied %d, error: %v", msg.n, msg.err)
+			m.err = msg.err
+			return m, nil
+		}
+		if msg.n > 0 {
+			m.marked = map[string]bool{} // one-shot: clear marks after copy
+			m.status = fmt.Sprintf("copied %d file(s) to %s ✓", msg.n, msg.dir)
+		} else {
+			m.status = "nothing copied"
+		}
 
 	case savedMsg:
 		if msg.err != nil {
@@ -532,6 +591,7 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 			m.view = "people"
 			m.assets = nil
 			m.preview = ""
+			m.previewCols, m.previewRows = 0, 0
 			m.cursor = 0
 			m.nextCursor = ""
 			m.person = ""
@@ -541,6 +601,7 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 			m.view = "recent"
 			m.assets = nil
 			m.preview = ""
+			m.previewCols, m.previewRows = 0, 0
 			m.nextCursor = ""
 			m.cursor = 0
 			m.context = ""
@@ -551,6 +612,7 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.view = "people"
 		m.assets = nil
 		m.preview = ""
+		m.previewCols, m.previewRows = 0, 0
 		m.cursor = 0
 		m.nextCursor = ""
 		m.context = ""
@@ -584,6 +646,7 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 			m.context = "people named " + p.Name
 			m.assets = nil
 			m.preview = ""
+			m.previewCols, m.previewRows = 0, 0
 			m.nextCursor = ""
 			m.cursor = 0
 			return m, loadPerson(m.client, p.ID)
@@ -604,6 +667,24 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 				return m, fetchOcr(m.client, a.ID)
 			}
 		}
+	case "x":
+		// mark/unmark the selected asset for copying
+		if a := m.selected(); a != nil {
+			if m.marked[a.ID] {
+				delete(m.marked, a.ID)
+				m.status = ""
+			} else {
+				m.marked[a.ID] = true
+				m.status = fmt.Sprintf("marked (%d) — c to copy", len(m.marked))
+			}
+		}
+	case "c":
+		// copy marked assets (or the selected one) to a folder, with an
+		// optional explicit file name; originals come from Immich at full
+		// resolution
+		if a := m.selected(); a != nil {
+			m.startInput(inputCopy, m.cfg.CopyDir)
+		}
 	case "o":
 		if a := m.selected(); a != nil {
 			url := m.client.base + "/photos/" + a.ID
@@ -617,19 +698,113 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 	return m, nil
 }
 
+// runCopy copies the marked assets (or the selected one, when nothing is
+// marked) to the given destination. A destination whose last component has
+// a file extension is an explicit file name (numbered variants when
+// copying several); anything else is the target folder and each asset
+// keeps its original name.
+func runCopy(m *model, dest string) tea.Cmd {
+	ids := []Asset{}
+	for _, a := range m.assets {
+		if m.marked[a.ID] {
+			ids = append(ids, a)
+		}
+	}
+	if len(ids) == 0 {
+		if a := m.selected(); a != nil {
+			ids = []Asset{*a}
+		}
+	}
+	if len(ids) == 0 {
+		m.status = "nothing to copy"
+		return nil
+	}
+	if os.Getenv("IMTUI_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[copy marked=%d total_marked=%d dest=%q]\n", len(ids), len(m.marked), dest)
+	}
+
+	dest = expand(strings.TrimSpace(dest))
+	dir, name := filepath.Split(dest)
+	name = strings.TrimSpace(name)
+	if filepath.Ext(name) != "" {
+		// explicit file name — multi-copy gets numbered variants
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		for i := range ids {
+			n := name
+			if i > 0 {
+				n = fmt.Sprintf("%s-%02d%s", base, i+1, filepath.Ext(name))
+			}
+			ids[i].OriginalFileName = n
+		}
+	} else {
+		// folder destination (created if missing)
+		dir = dest
+		name = ""
+	}
+
+	m.status = fmt.Sprintf("copying %d file(s)…", len(ids))
+	assets := ids
+	return func() tea.Msg {
+		n, err := copyOriginals(m.client, assets, dir)
+		return copiedMsg{n: n, dir: dir, err: err}
+	}
+}
+
+// copyOriginals downloads each asset's original file into dir, avoiding
+// name collisions with " (n)" suffixes. Returns the count copied and the
+// first error (remaining files are still attempted).
+func copyOriginals(c *Client, assets []Asset, dir string) (int, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, err
+	}
+	var firstErr error
+	n := 0
+	for _, a := range assets {
+		name := sanitizeFileName(a.OriginalFileName)
+		dest := filepath.Join(dir, name)
+		for i := 2; fileExists(dest); i++ {
+			ext := filepath.Ext(name)
+			dest = filepath.Join(dir, strings.TrimSuffix(name, ext)+fmt.Sprintf(" (%d)%s", i, ext))
+		}
+		if err := c.Original(a.ID, dest); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		n++
+	}
+	return n, firstErr
+}
+
+// sanitizeFileName strips path components from an Immich file name.
+func sanitizeFileName(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" {
+		name = "image"
+	}
+	return name
+}
+
 // showArt makes art the visible preview for the asset. Any previously
 // displayed image is deleted in the same frame, after the new art — so
 // during fast scrolling exactly one image stays on screen and the new one
 // is already on top (monotonic ids) before the old goes away: no flash.
 // Lowercase d=i removes placements but keeps the image data, so scrolling
 // back to a shown asset can still re-place it from placeCache without a
-// re-transmit.
-func (m *model) showArt(id, art string) {
+// re-transmit. cols/rows carry the aspect-fitted placement size for the
+// view (0 = symbols mode / full pane).
+func (m *model) showArt(id, art string, cols, rows int) {
 	kid := kittyIDFor(id)
 	if m.lastKittyID != 0 && m.lastKittyID != kid {
 		art += kittyDelete(m.lastKittyID)
 	}
 	m.preview = art
+	m.previewCols = cols
+	m.previewRows = rows
 	m.lastKittyID = kid
 	m.freshID = id
 	m.lastShow = time.Now()
@@ -678,16 +853,21 @@ func (m *model) schedulePreview() tea.Cmd {
 		return nil
 	}
 	key := m.previewKey(a.ID)
+	c, hasCached := m.previewCache[key]
 	if place, ok := m.placeCache[key]; ok {
 		// drawn before: the image is already uploaded to the terminal
-		m.showArt(a.ID, place)
+		cols, rows := 0, 0
+		if hasCached {
+			cols, rows = c.cols, c.rows
+		}
+		m.showArt(a.ID, place, cols, rows)
 		m.pending = ""
 		if _, has := m.detail[a.ID]; !has {
 			return fetchDetail(m.client, a.ID)
 		}
 		return nil
 	}
-	if c, ok := m.previewCache[key]; ok {
+	if hasCached {
 		if c.fresh {
 			// still carrying the transmit (pre-rendered neighbor): it will
 			// be swapped to place by settleFreshPreview once displayed.
@@ -700,7 +880,7 @@ func (m *model) schedulePreview() tea.Cmd {
 			m.pending = a.ID
 			return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 		}
-		m.showArt(a.ID, c.art)
+		m.showArt(a.ID, c.art, c.cols, c.rows)
 		m.pending = ""
 		return fetchDetailIfMissing(m, a.ID)
 	}
@@ -800,6 +980,9 @@ func (m *model) startInput(use inputUse, prefill string) {
 	case inputRename:
 		m.input.Placeholder = "person's name"
 		m.input.Prompt = "name: "
+	case inputCopy:
+		m.input.Placeholder = "folder (optionally end with a file name)"
+		m.input.Prompt = "copy to: "
 	}
 	m.input.SetValue(prefill)
 	m.input.Focus()
@@ -844,6 +1027,11 @@ func (m *model) submitInput() tea.Cmd {
 				return savePersonName(m.client, p.ID, val)
 			}
 		}
+	case inputCopy:
+		if val == "" {
+			return nil
+		}
+		return runCopy(m, val)
 	}
 	return nil
 }
@@ -947,6 +1135,16 @@ func (m model) assetViewKitty() string {
 	if len(right) > n {
 		n = len(right)
 	}
+	// imageRows mirrors paneLinesKitty's reservation: the rows the image
+	// placement covers.
+	imageRows := m.previewRows
+	if m.preview == "" || imageRows < 1 {
+		imageRows = m.previewH()
+	}
+	centerPad := 0
+	if m.preview != "" && m.previewCols > 0 && m.previewCols < m.previewW() {
+		centerPad = (m.previewW() - m.previewCols) / 2
+	}
 	rows := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		l := ""
@@ -959,15 +1157,21 @@ func (m model) assetViewKitty() string {
 			r = right[i]
 		}
 		row := l + "  " + r
-		if i < m.previewH() {
-			// The image occupies previewH terminal rows starting at this
-			// pane's column. bubbletea appends ESC[K (erase to end of line)
-			// to every changed row narrower than the terminal, which would
+		if i < imageRows {
+			// The image covers these terminal rows starting at the pane's
+			// column. bubbletea appends ESC[K (erase to end of line) to
+			// every changed row narrower than the terminal, which would
 			// erase straight across the image cells on each scroll step.
 			// Appending a cursor-forward parks the cursor past the image's
 			// right edge, so the erase lands on empty space instead. CUF
 			// prints nothing, so it is safe even on the graphics line.
-			row += fmt.Sprintf("\x1b[%dC", m.previewW())
+			// The image line already carries centerPad spaces, so its
+			// forward amount shrinks by that much.
+			fwd := m.previewW()
+			if i == 0 {
+				fwd -= centerPad
+			}
+			row += fmt.Sprintf("\x1b[%dC", fwd)
 		}
 		rows = append(rows, row)
 	}
@@ -1012,8 +1216,12 @@ func (m model) listBlock() string {
 			if i == m.cursor {
 				mark, style = selMark, selStyle
 			}
+			name := truncate(a.OriginalFileName, listW-14)
+			if m.marked[a.ID] {
+				name = truncate(a.OriginalFileName, listW-16) + " ✓"
+			}
 			line := fmt.Sprintf("%s %s %s",
-				mark, dimStyle.Render(shortDate(a.CreatedAt)), style.Render(truncate(a.OriginalFileName, listW-14)))
+				mark, dimStyle.Render(shortDate(a.CreatedAt)), style.Render(name))
 			rows = append(rows, clipWidth(line, listW))
 		}
 	}
@@ -1045,13 +1253,26 @@ func (m model) paneLinesKitty() []string {
 	if a == nil {
 		return nil
 	}
+	// imageRows = the aspect-fitted placement height of the shown preview
+	// (metadata sits directly under the image, not at the pane's bottom).
+	imageRows := m.previewRows
 	var lines []string
 	if m.preview != "" {
-		lines = append(lines, m.preview)
+		if m.previewCols > 0 && m.previewCols < m.previewW() {
+			// center the (narrower) image horizontally in the pane
+			pad := strings.Repeat(" ", (m.previewW()-m.previewCols)/2)
+			lines = append(lines, pad+m.preview)
+		} else {
+			lines = append(lines, m.preview)
+		}
 	} else {
+		imageRows = 0
 		lines = append(lines, dimStyle.Render(strings.Repeat("·", m.previewW())))
 	}
-	for i := 1; i < m.previewH(); i++ {
+	if imageRows < 1 {
+		imageRows = m.previewH() // no placement yet: reserve the full pane
+	}
+	for i := 1; i < imageRows; i++ {
 		lines = append(lines, "")
 	}
 	return append(lines, m.assetMeta(64)...)
@@ -1222,7 +1443,7 @@ func (m model) footer() string {
 	hints := []struct{ k, v string }{
 		{"j/k", "move"}, {"/", "search"}, {"p", "people"},
 		{"s", "similar"}, {"e", "describe"}, {"t", "ocr"},
-		{"o", "open"}, {"q", "quit"},
+		{"x", "mark"}, {"c", "copy"}, {"o", "open"}, {"q", "quit"},
 	}
 	if m.view == "people" {
 		hints = []struct{ k, v string }{

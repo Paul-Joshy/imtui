@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
+	"image/png"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -49,6 +53,80 @@ func TestKittySequenceStructure(t *testing.T) {
 	}
 }
 
+// fitCells must preserve the photo's proportions: the chosen cell rect's
+// pixel size (cols*cw × rows*ch) matches the image aspect as exactly as the
+// cell grid allows, and never exceeds the budget.
+func TestFitCells(t *testing.T) {
+	kittyCellW, kittyCellH = 8, 16 // 1:2 cells like the default assumption
+	cases := []struct {
+		name       string
+		A          float64 // source width/height
+		bw, bh     int
+		wantErrMax float64 // max relative aspect error tolerated
+	}{
+		{"square", 1.0, 44, 20, 0.005},
+		{"portrait 2:3", 2.0 / 3.0, 44, 20, 0.005},
+		{"portrait 3:4", 3.0 / 4.0, 44, 20, 0.005},
+		{"landscape 4:3", 4.0 / 3.0, 44, 20, 0.005},
+		{"landscape 16:9", 16.0 / 9.0, 44, 20, 0.005},
+		{"panorama", 3.0, 44, 20, 0.005},
+		{"narrow portrait 9:16", 9.0 / 16.0, 44, 20, 0.005},
+	}
+	for _, tc := range cases {
+		c, r := fitCells(tc.A, tc.bw, tc.bh)
+		if c < 1 || r < 1 || c > tc.bw || r > tc.bh {
+			t.Fatalf("%s: out of budget %dx%d: %dx%d", tc.name, tc.bw, tc.bh, c, r)
+		}
+		got := float64(c) * 8 / (float64(r) * 16)
+		err := math.Abs(got-tc.A) / tc.A
+		if err > tc.wantErrMax {
+			t.Errorf("%s: %dx%d cells → aspect %.4f, want %.4f (err %.1f%%)",
+				tc.name, c, r, got, tc.A, err*100)
+		}
+	}
+}
+
+// images are resized 1:1 onto the placement cells: the bitmap dims must
+// equal cols*cellW × rows*cellH (checked via the sequence's PNG header).
+func TestKittyBitmapMatchesPlacement(t *testing.T) {
+	path := findCachedThumb(t)
+	kittyCellW, kittyCellH = 8, 16
+	cols, rows := 30, 15
+	transmit, _, err := kittyImageSequence(path, cols, rows, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// extract the base64 payload of the single-chunk transmit
+	i := strings.Index(transmit, ";")
+	j := strings.Index(transmit[i:], "\x1b\\")
+	raw, err := base64.StdEncoding.DecodeString(transmit[i+1 : i+j])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := png.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Width != cols*8 || cfg.Height != rows*16 {
+		t.Fatalf("bitmap %dx%d, want %dx%d", cfg.Width, cfg.Height, cols*8, rows*16)
+	}
+}
+
+func TestParseCellSize(t *testing.T) {
+	// kitty: direct cell size report
+	if w, h := parseCellSize("\x1b[?25l\x1b[6;20;9t"); w != 9 || h != 20 {
+		t.Fatalf("16t: got %dx%d, want 9x20", w, h)
+	}
+	// window pixels + window cells
+	s := "\x1b[4;400;72t\x1b[8;20;9t\x1b[0m"
+	if w, h := parseCellSize(s); w != 8 || h != 20 {
+		t.Fatalf("14t+18t: got %dx%d, want 8x20", w, h)
+	}
+	if w, h := parseCellSize("garbage"); w != 0 || h != 0 {
+		t.Fatalf("garbage: got %dx%d", w, h)
+	}
+}
+
 func TestKittyDelete(t *testing.T) {
 	want := "\x1b_Ga=d,d=i,i=42,q=2\x1b\\\\"
 	if got := kittyDelete(42); got != want {
@@ -75,11 +153,11 @@ func TestSettleFreshPreview(t *testing.T) {
 	// display the previous image, then the new one — showArt appends the
 	// delete of the previous image and tracks the ids
 	m.lastKittyID = 0 // first display: nothing to delete
-	m.showArt(prev, "OLD")
+	m.showArt(prev, "OLD", 0, 0)
 	if strings.Contains(m.preview, "a=d") {
 		t.Fatalf("first display must not delete: %q", m.preview)
 	}
-	m.showArt(id, "TRANSMIT+PLACE")
+	m.showArt(id, "TRANSMIT+PLACE", 44, 20)
 	if !strings.HasSuffix(m.preview, kittyDelete(kittyIDFor(prev))) {
 		t.Fatalf("second display must delete the previous image: %q", m.preview)
 	}
@@ -119,19 +197,19 @@ func TestSettleFreshPreview(t *testing.T) {
 func TestShowArtDeletesPrevious(t *testing.T) {
 	a, b, c := "aaaaaaaa", "bbbbbbbb", "cccccccc"
 	m := model{proto: "kitty"}
-	m.showArt(a, "A")
+	m.showArt(a, "A", 44, 20)
 	if strings.Contains(m.preview, "a=d") {
 		t.Fatalf("first display must not delete: %q", m.preview)
 	}
-	m.showArt(b, "B")
+	m.showArt(b, "B", 44, 20)
 	if !strings.HasSuffix(m.preview, kittyDelete(kittyIDFor(a))) {
 		t.Fatalf("second display must delete the first: %q", m.preview)
 	}
-	m.showArt(c, "C")
+	m.showArt(c, "C", 44, 20)
 	if !strings.HasSuffix(m.preview, kittyDelete(kittyIDFor(b))) {
 		t.Fatalf("third display must delete the second: %q", m.preview)
 	}
-	m.showArt(c, "C")
+	m.showArt(c, "C", 44, 20)
 	if strings.Contains(m.preview, "a=d") {
 		t.Fatalf("re-displaying the current image must not delete: %q", m.preview)
 	}

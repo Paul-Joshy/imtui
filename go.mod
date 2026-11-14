@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.6
 	golang.org/x/image v0.48.0
+	golang.org/x/term v0.48.0
 )
 
 require (

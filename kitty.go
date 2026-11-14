@@ -17,10 +17,14 @@ import (
 	"hash/fnv"
 	"image"
 	"image/png"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/term"
 
 	_ "image/jpeg"
 	_ "image/png"
@@ -28,11 +32,11 @@ import (
 	"golang.org/x/image/draw"
 )
 
-const (
-	// Assumed cell pixel size when the terminal can't be queried. This is
-	// kitty's common default font grid (and what chafa falls back to).
+// Assumed cell pixel size (1:2, matching most terminal fonts and chafa's
+// assumption) until queryCellSize refines it to the real terminal grid.
+var (
 	kittyCellW = 8
-	kittyCellH = 20
+	kittyCellH = 16
 )
 
 // kitty image ids must increase monotonically as new photos are displayed:
@@ -124,7 +128,8 @@ func detectImageProtocol(cfg Config) string {
 //   - q=2: no responses back from the terminal.
 func kittyImageSequence(path string, cols, rows, id int) (transmit, place string, err error) {
 	var pngBytes []byte
-	cache := expand(fmt.Sprintf("~/.cache/imtui/kitty/%d_%dx%d.png", fnv32a(path), cols, rows))
+	cache := expand(fmt.Sprintf("~/.cache/imtui/kitty/%d_%dx%d_%dx%d.png",
+		fnv32a(path), cols, rows, kittyCellW, kittyCellH))
 	if b, err := os.ReadFile(cache); err == nil {
 		pngBytes = b
 	} else {
@@ -136,8 +141,8 @@ func kittyImageSequence(path string, cols, rows, id int) (transmit, place string
 		if err != nil {
 			return "", "", fmt.Errorf("decode thumbnail: %w", err)
 		}
-		// resize into the cell grid's pixel aspect so the terminal's stretch
-		// to cols×rows cells doesn't distort the image
+		// resize to exactly the placement's pixel grid so the terminal's
+		// cell mapping is 1:1 and proportions are preserved
 		dst := image.NewRGBA(image.Rect(0, 0, cols*kittyCellW, rows*kittyCellH))
 		draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Src, nil)
 
@@ -180,6 +185,115 @@ func kittyImageSequence(path string, cols, rows, id int) (transmit, place string
 	transmit = sb.String()
 	place = fmt.Sprintf("\x1b_Ga=p,i=%d,p=1,q=2,c=%d,r=%d,C=1\x1b\\", id, cols, rows)
 	return transmit, place, nil
+}
+
+// fitCells returns the cell rectangle (cols×rows, within the budget) whose
+// on-screen pixel size best matches the image aspect A — i.e. the largest
+// area with the least proportion error, searched over every row count. The
+// resized bitmap then maps 1:1 onto the placement cells, so photo
+// proportions are preserved exactly.
+func fitCells(A float64, bw, bh int) (cols, rows int) {
+	bestErr := math.Inf(1)
+	bestArea := 0
+	for r := bh; r >= 1; r-- {
+		c := int(math.Round(A * float64(r) * float64(kittyCellH) / float64(kittyCellW)))
+		if c < 1 {
+			c = 1
+		}
+		if c > bw {
+			continue // too wide for this r (and wider r only gets worse)
+		}
+		err := math.Abs(float64(c)*float64(kittyCellW)/(float64(r)*float64(kittyCellH))-A) / A
+		area := c * r
+		if err < bestErr-1e-9 || (err < bestErr+1e-9 && area > bestArea) {
+			bestErr, bestArea, cols, rows = err, area, c, r
+		}
+	}
+	if cols == 0 {
+		cols, rows = 1, 1
+	}
+	return cols, rows
+}
+
+// queryCellSize asks the terminal for the actual pixel size of a character
+// cell so placement preserves photo proportions exactly. Sources, in order:
+// tmux's own knowledge (#{client_cell_width/height}, when it has it), then
+// direct CSI queries (16 t cell size; 14 t window pixels + 18 t window
+// cells). Best-effort — on any failure the 1:2 default is kept.
+func queryCellSize() {
+	cw, ch := 0, 0
+	if os.Getenv("TMUX") != "" {
+		if out, err := exec.Command("tmux", "display-message", "-p",
+			"#{client_cell_width} #{client_cell_height}").Output(); err == nil {
+			fmt.Sscanf(string(out), "%d %d", &cw, &ch)
+		}
+	}
+	if cw <= 0 || ch <= 0 {
+		cw, ch = csiQueryCellSize()
+	}
+	if cw > 0 && ch > 0 && cw <= 100 && ch <= 200 {
+		kittyCellW, kittyCellH = cw, ch
+		if os.Getenv("IMTUI_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "[cell %dx%d]\n", cw, ch)
+		}
+	}
+}
+
+// csiQueryCellSize sends the CSI queries and parses the responses.
+func csiQueryCellSize() (w, h int) {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return 0, 0
+	}
+	state, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return 0, 0
+	}
+	defer term.Restore(int(os.Stdin.Fd()), state)
+	if err := os.Stdin.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		return 0, 0
+	}
+	q := wrapTmuxPassthroughCSI("\x1b[16t\x1b[14t\x1b[18t")
+	os.Stdout.WriteString(q)
+
+	buf := make([]byte, 256)
+	n, _ := os.Stdin.Read(buf)
+	return parseCellSize(string(buf[:n]))
+}
+
+// parseCellSize extracts the cell pixel size from terminal query replies.
+// Recognizes CSI 6;<h>;<w>t (direct cell size) and the window-pixels (4;…)
+// + window-cells (8;…) pair used to derive it.
+func parseCellSize(s string) (w, h int) {
+	if i := strings.Index(s, "\x1b[6;"); i >= 0 {
+		if _, err := fmt.Sscanf(s[i:], "\x1b[6;%d;%dt", &h, &w); err == nil && w > 0 && h > 0 {
+			return w, h
+		}
+	}
+	i := strings.Index(s, "\x1b[4;")
+	if i < 0 {
+		return 0, 0
+	}
+	var winH, winW, rows, cols int
+	if _, err := fmt.Sscanf(s[i:], "\x1b[4;%d;%dt", &winH, &winW); err != nil {
+		return 0, 0
+	}
+	j := strings.Index(s, "\x1b[8;")
+	if j < 0 {
+		return 0, 0
+	}
+	if _, err := fmt.Sscanf(s[j:], "\x1b[8;%d;%dt", &rows, &cols); err != nil || cols <= 0 || rows <= 0 {
+		return 0, 0
+	}
+	return winW / cols, winH / rows
+}
+
+// wrapTmuxPassthroughCSI DCS-wraps plain CSI sequences for tmux passthrough
+// (tmux requires ESC bytes inside the payload to be doubled).
+func wrapTmuxPassthroughCSI(s string) string {
+	if os.Getenv("TMUX") == "" {
+		return s
+	}
+	return "\x1bPtmux;" + strings.ReplaceAll(s, "\x1b", "\x1b\x1b") + "\x1b\\"
 }
 
 // wrapTmuxAPC wraps every APC block (ESC _ … ESC \) in tmux DCS passthrough
