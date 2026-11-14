@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -12,9 +13,11 @@ import (
 // ---------- client ----------
 
 type Client struct {
-	base string
-	key  string
-	http *http.Client
+	base      string
+	key       string
+	ownerID   string // filled by FetchOwner; used for direct thumbnail paths
+	thumbsDir string // Immich data thumbs dir (server-local fast path)
+	http      *http.Client
 }
 
 func NewClient(base, key string) *Client {
@@ -23,6 +26,57 @@ func NewClient(base, key string) *Client {
 		key:  key,
 		http: &http.Client{Timeout: 60 * time.Second},
 	}
+}
+
+// SetThumbsDir points the client at the server's generated thumbnail files
+// (e.g. the docker volume mount .../library/thumbs). When set, previews are
+// read straight from disk instead of the API.
+func (c *Client) SetThumbsDir(dir string) {
+	if dir != "" {
+		c.thumbsDir = expand(dir)
+	}
+}
+
+// FetchOwner caches the current user id (needed to locate thumbnail files).
+func (c *Client) FetchOwner() error {
+	b, err := c.do("GET", "/users/me", nil)
+	if err != nil {
+		return err
+	}
+	var u struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(b, &u); err != nil {
+		return err
+	}
+	c.ownerID = u.ID
+	return nil
+}
+
+// ThumbPath returns a readable image file for the asset. preferPreview
+// selects the large preview (kitty mode needs pixels); otherwise the small
+// thumbnail. Served from the server's files when available, else the API
+// (cached to cacheDir after first download).
+func (c *Client) ThumbPath(id string, preferPreview bool, cacheDir string) (string, error) {
+	if c.thumbsDir != "" && c.ownerID != "" && len(id) >= 4 {
+		kind := "thumbnail.webp"
+		if preferPreview {
+			kind = "preview.jpeg"
+		}
+		p := filepath.Join(c.thumbsDir, c.ownerID, id[:2], id[2:4], id+"_"+kind)
+		if fileExists(p) {
+			return p, nil
+		}
+	}
+	size, suffix := "thumbnail", "-small.jpg"
+	if preferPreview {
+		size, suffix = "preview", ".jpg"
+	}
+	cache := filepath.Join(cacheDir, "thumbs", id+suffix)
+	if err := c.Thumbnail(id, cache, size); err != nil {
+		return "", err
+	}
+	return cache, nil
 }
 
 func (c *Client) do(method, path string, body any) ([]byte, error) {
@@ -205,11 +259,12 @@ func (c *Client) MetadataSearch(personIDs []string, cursor string, newestFirst b
 }
 
 // Thumbnail downloads a preview thumbnail to path (no-op if cached).
-func (c *Client) Thumbnail(id, path string) error {
+// size is "thumbnail" (small, fast) or "preview" (larger, for kitty images).
+func (c *Client) Thumbnail(id, path, size string) error {
 	if fileExists(path) {
 		return nil
 	}
-	b, err := c.do("GET", "/assets/"+id+"/thumbnail?size=preview&format=JPEG", nil)
+	b, err := c.do("GET", "/assets/"+id+"/thumbnail?size="+size+"&format=JPEG", nil)
 	if err != nil {
 		return err
 	}

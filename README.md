@@ -18,6 +18,12 @@ browser.
 ## Features
 
 - **Browse** — newest photos first, paged as you scroll
+- **Real-pixel previews** — in kitty/ghostty-class terminals, photos are
+  drawn with the kitty graphics protocol (actual pixels, not ASCII art);
+  falls back to crisp chafa half-block previews everywhere else
+- **Fast** — thumbnails are read straight off the server's disk when the
+  library is local, renders are cached in memory and on disk, and neighbors
+  are pre-rendered as you move
 - **Search by context** — CLIP smart search: type what you're looking for
   ("dog on the beach", "screenshot", "birthday cake")
 - **Search by image** — press `s` on any photo to find visually similar ones
@@ -41,7 +47,7 @@ browser.
 | `t` | show OCR'd text |
 | `o` | open in browser |
 | `esc` | back |
-| `q` | quit |
+| `q` | quit (`ctrl+c` works anywhere, even mid-input) |
 
 ## Install
 
@@ -49,20 +55,25 @@ browser.
 go build -o ~/.local/bin/imtui .
 ```
 
-Requires: an Immich server (v3+ recommended), `chafa` on your PATH
-(`brew install chafa`), and a macOS terminal for the `o` key
-(`open` command).
+Requires: an Immich server (v3+ recommended). For symbol previews also
+install [chafa](https://hpjansson.com/chafa/) (`brew install chafa`); the
+kitty graphics path needs no external tools. `o` uses macOS `open`.
 
 ## Configuration
 
 `~/.config/imtui/config.toml` (created by hand; env overrides `IMTUI_URL`,
-`IMTUI_KEY`, `IMTUI_CONFIG`):
+`IMTUI_KEY`, `IMTUI_CONFIG`, `IMTUI_PROTOCOL`):
 
 ```toml
 server_url = "http://localhost:2283"
 api_key    = "your-immich-api-key"   # Immich web → Account → API Keys
 preview_width  = 44
 preview_height = 20
+# generated thumbnails on disk — read directly instead of the API when the
+# Immich library is local (docker compose usually mounts ./library)
+thumbs_dir = "~/Documents/immich-app/library/thumbs"
+# preview rendering: "auto" (detect kitty), "kitty", or "symbols" (ANSI art)
+image_protocol = "auto"
 ```
 
 Get an API key from the Immich web UI: **Account Settings → API Keys →
@@ -72,7 +83,11 @@ New API Key**. The key stays in that local file.
 
 - Thumbnails and search are read-mostly; the only writes are description
   edits and person renames, both explicit keypresses.
-- Previews are cached in `~/.cache/imtui/thumbs/`.
+- Previews are cached in `~/.cache/imtui/` (`thumbs/` from the API,
+  `kitty/` as encoded images for the graphics protocol).
+- **Kitty graphics + tmux**: tmux must forward the sequences — put
+  `set -g allow-passthrough on` in `~/.tmux.conf` (and reload it) if images
+  don't appear inside tmux.
 
 ## License
 

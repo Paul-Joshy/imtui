@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,7 +32,13 @@ func main() {
 		os.Exit(1)
 	}
 	c := NewClient(cfg.ServerURL, cfg.APIKey)
-	p := tea.NewProgram(initialModel(c, cfg), tea.WithAltScreen())
+	c.SetThumbsDir(cfg.ThumbsDir)
+	// best-effort: only needed for direct disk reads of thumbnails
+	_ = c.FetchOwner()
+
+	m := initialModel(c, cfg)
+	m.proto = detectImageProtocol(cfg)
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "imtui:", err)
 		os.Exit(1)
@@ -43,10 +48,12 @@ func main() {
 // ---------- config ----------
 
 type Config struct {
-	ServerURL string `toml:"server_url"`
-	APIKey    string `toml:"api_key"`
-	PreviewW  int    `toml:"preview_width"`
-	PreviewH  int    `toml:"preview_height"`
+	ServerURL     string `toml:"server_url"`
+	APIKey        string `toml:"api_key"`
+	PreviewW      int    `toml:"preview_width"`
+	PreviewH      int    `toml:"preview_height"`
+	ImageProtocol string `toml:"image_protocol"` // auto | kitty | symbols
+	ThumbsDir     string `toml:"thumbs_dir"`     // Immich library/thumbs for direct disk reads
 }
 
 const configPath = "~/.config/imtui/config.toml"
@@ -98,11 +105,19 @@ var (
 
 type tickMsg struct{}
 
+// swapMsg replaces the fresh preview art (which carries the full image
+// transmission) with the cheap re-place sequence after it has been drawn.
+type swapMsg struct {
+	id    string
+	place string
+}
+
 type resultsMsg struct {
 	assets     []Asset
 	total      int
 	nextCursor string
 	context    string // human description of what produced this list
+	search     bool   // true when produced by a smart search (not a listing)
 	append     bool   // true = keep existing rows (paging), false = replace
 	err        error
 }
@@ -113,9 +128,10 @@ type detailMsg struct {
 }
 
 type previewMsg struct {
-	id  string
-	art string
-	err error
+	id    string
+	art   string
+	place string // kitty: cheap re-place sequence for later frames
+	err   error
 }
 
 type ocrMsg struct {
@@ -138,22 +154,34 @@ const (
 	inputRename inputUse = "rename"
 )
 
+// cachedArt is a rendered preview: art is what's drawn first (symbols ANSI
+// or a kitty transmit+place); place is the cheap re-display sequence for
+// later frames (symbols mode leaves it empty — art is reused as-is).
+type cachedArt struct {
+	art   string
+	place string
+}
+
 type model struct {
 	client  *Client
 	cfg     Config
+	proto   string // image protocol: "symbols" or "kitty"
 	view    view
 	context string // header description of the current list ("recent", "similar to X", "people named Paul")
 
 	// list state (search results, recent, or a person's photos)
-	assets     []Asset
-	nextCursor string // metadata-search cursor for incremental loading
-	person     string // person id when view==person
-	people     []PersonFull
+	assets      []Asset
+	nextCursor  string // metadata-search cursor for incremental loading
+	loadingMore bool   // a page fetch is in flight (dedupes repeat requests)
+	person      string // person id when view==person
+	people      []PersonFull
 
 	cursor       int
-	preview      string            // chafa ANSI art of the selected asset
-	pending      string            // asset id queued for preview render
-	previewCache map[string]string // "id:WxH" -> rendered art (this session)
+	preview      string // art of the selected asset (ANSI or kitty sequences)
+	pending      string // asset id queued for preview render
+	previewCache map[string]cachedArt
+	placeCache   map[string]string // "id:WxH" -> cheap re-place sequence (after first draw)
+	freshID      string            // asset whose preview still contains the transmit
 	detail       map[string]Asset
 	ocr          map[string]string
 	ocrShow      bool
@@ -179,7 +207,8 @@ func initialModel(c *Client, cfg Config) model {
 		view:         "recent",
 		detail:       map[string]Asset{},
 		ocr:          map[string]string{},
-		previewCache: map[string]string{},
+		previewCache: map[string]cachedArt{},
+		placeCache:   map[string]string{},
 		input:        ti,
 	}
 }
@@ -210,7 +239,7 @@ func loadPerson(c *Client, person string) tea.Cmd {
 func runSearch(c *Client, query, assetID string, ocr bool, context string) tea.Cmd {
 	return func() tea.Msg {
 		assets, total, err := c.SmartSearch(query, assetID, ocr, 100)
-		return resultsMsg{assets: assets, total: total, context: context, err: err}
+		return resultsMsg{assets: assets, total: total, context: context, search: true, err: err}
 	}
 }
 
@@ -240,13 +269,28 @@ func fetchOcr(c *Client, id string) tea.Cmd {
 	}
 }
 
-// renderPreview downloads the thumbnail (disk-cached) and runs chafa,
-// restricted to ANSI symbols (half-blocks) — never the kitty protocol.
-func renderPreview(c *Client, id string, cols, rows int) tea.Cmd {
+// renderPreview prepares the preview art for one asset.
+//   - symbols mode: chafa half-blocks over a small thumbnail (~9 KB)
+//   - kitty mode: the terminal draws real pixels — we resize the full
+//     preview image and speak the kitty graphics protocol (see kitty.go)
+func renderPreview(c *Client, id string, cols, rows int, proto string) tea.Cmd {
 	return func() tea.Msg {
-		cache := filepath.Join(expand("~/.cache/imtui"), "thumbs", id+".jpg")
-		if err := c.Thumbnail(id, cache); err != nil {
+		path, err := c.ThumbPath(id, proto == "kitty", expand("~/.cache/imtui"))
+		if err != nil {
 			return previewMsg{id: id, err: err}
+		}
+		if proto == "kitty" {
+			transmit, place, err := kittyImageSequence(path, cols, rows, kittyID(id))
+			if err != nil {
+				return previewMsg{id: id, err: err}
+			}
+			// art = transmit + place for the first draw; later frames
+			// re-place with the cheap sequence only.
+			return previewMsg{
+				id:    id,
+				art:   wrapTmuxAPC(transmit + place),
+				place: wrapTmuxAPC(place),
+			}
 		}
 		out, err := exec.Command("chafa",
 			"--format", "symbols",
@@ -254,7 +298,7 @@ func renderPreview(c *Client, id string, cols, rows int) tea.Cmd {
 			"--colors", "256",
 			"-s", fmt.Sprintf("%dx%d", cols, rows),
 			"--animate", "off",
-			cache).Output()
+			path).Output()
 		if err != nil {
 			return previewMsg{id: id, err: fmt.Errorf("chafa: %v", err)}
 		}
@@ -295,18 +339,33 @@ func (m model) selected() *Asset {
 // ---------- update ----------
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if os.Getenv("IMTUI_DEBUG") != "" {
+		if _, isKey := msg.(tea.KeyMsg); !isKey {
+			fmt.Fprintf(os.Stderr, "[msg %T]\n", msg)
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 
 	case tickMsg:
-		// debounce: only render when the pending id is still the selection
+		// debounce fired: render the preview (only if still the selection)
 		if a := m.selected(); a != nil && m.pending == a.ID {
 			m.pending = ""
-			return m, tea.Batch(
-				renderPreview(m.client, a.ID, m.previewW(), m.previewH()),
-				fetchDetail(m.client, a.ID),
-			)
+			cmds := []tea.Cmd{renderPreview(m.client, a.ID, m.previewW(), m.previewH(), m.proto)}
+			if _, ok := m.detail[a.ID]; !ok {
+				cmds = append(cmds, fetchDetail(m.client, a.ID))
+			}
+			return m, tea.Batch(cmds...)
+		}
+
+	case swapMsg:
+		// the transmitted image has been drawn once; from now on the frame
+		// only needs the cheap re-place command.
+		if a := m.selected(); a != nil && m.freshID == msg.id && a.ID == msg.id && msg.place != "" {
+			m.placeCache[m.previewKey(msg.id)] = msg.place
+			m.preview = msg.place
+			m.freshID = ""
 		}
 
 	case resultsMsg:
@@ -317,13 +376,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.append {
 			m.assets = append(m.assets, msg.assets...)
+			m.loadingMore = false
 		} else {
 			m.assets = msg.assets
 			m.cursor = 0
 			m.preview = ""
+			m.freshID = ""
+			m.loadingMore = false
 			m.ocrShow = false
 			if msg.context != "" {
 				m.context = msg.context
+			}
+			if msg.search {
+				m.view = "search"
+				m.person = ""
 			}
 		}
 		m.nextCursor = msg.nextCursor
@@ -349,10 +415,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "preview: " + msg.err.Error()
 		}
 		if msg.art != "" {
-			m.previewCache[m.previewKey(msg.id)] = msg.art
+			m.previewCache[m.previewKey(msg.id)] = cachedArt{art: msg.art, place: msg.place}
 		}
-		if a := m.selected(); a != nil && a.ID == msg.id {
+		if a := m.selected(); a != nil && a.ID == msg.id && msg.art != "" {
 			m.preview = msg.art
+			m.freshID = msg.id
+			// pre-render the rows above/below so scrolling hits the cache
+			return m, tea.Batch(
+				m.preRenderNeighbors(),
+				tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg {
+					return swapMsg{id: msg.id, place: msg.place}
+				}),
+			)
 		}
 
 	case ocrMsg:
@@ -417,10 +491,21 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 	// typing in the input line
 	if m.inputUse != "" {
 		switch k {
+		case "ctrl+c":
+			return m, tea.Quit
 		case "esc":
 			m.stopInput()
 		case "enter":
 			return m, m.submitInput()
+		case "q":
+			// an empty input line is never what you wanted — q dismisses it
+			if m.input.Value() == "" {
+				m.stopInput()
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
 		default:
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
@@ -529,25 +614,45 @@ func (m model) handleKey(msg tea.KeyMsg) (model, tea.Cmd) {
 	return m, nil
 }
 
-// schedulePreview queues a debounced preview render for the selection and
-// returns the tick command that fires it (batched with a detail fetch).
-// If the art is already in the session cache it shows instantly instead.
+// schedulePreview shows the preview for the selection: instantly from cache
+// when possible, otherwise schedules a debounced render. Returns the command
+// to run (detail fetch and/or tick), or nil.
 func (m *model) schedulePreview() tea.Cmd {
 	a := m.selected()
 	if a == nil {
 		m.pending = ""
 		return nil
 	}
-	if art, ok := m.previewCache[m.previewKey(a.ID)]; ok {
-		m.preview = art
+	key := m.previewKey(a.ID)
+	if place, ok := m.placeCache[key]; ok {
+		// drawn before: the image is already uploaded to the terminal
+		m.preview = place
 		m.pending = ""
 		if _, has := m.detail[a.ID]; !has {
 			return fetchDetail(m.client, a.ID)
 		}
 		return nil
 	}
+	if c, ok := m.previewCache[key]; ok {
+		m.preview = c.art
+		m.freshID = a.ID
+		m.pending = ""
+		return tea.Batch(
+			fetchDetailIfMissing(m, a.ID),
+			tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg {
+				return swapMsg{id: a.ID, place: c.place}
+			}),
+		)
+	}
 	m.pending = a.ID
-	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+func fetchDetailIfMissing(m *model, id string) tea.Cmd {
+	if _, has := m.detail[id]; has {
+		return nil
+	}
+	return fetchDetail(m.client, id)
 }
 
 // previewKey identifies a cached render: asset id + pane dimensions.
@@ -555,15 +660,44 @@ func (m *model) previewKey(id string) string {
 	return fmt.Sprintf("%s:%dx%d", id, m.previewW(), m.previewH())
 }
 
+// preRenderNeighbors renders the rows just above/below the cursor into the
+// cache, so single-step scrolling shows previews without waiting.
+func (m model) preRenderNeighbors() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, i := range []int{m.cursor - 1, m.cursor + 1} {
+		if i < 0 || i >= len(m.assets) {
+			continue
+		}
+		id := m.assets[i].ID
+		key := m.previewKey(id)
+		if _, ok := m.previewCache[key]; ok {
+			continue
+		}
+		cmds = append(cmds, renderPreview(m.client, id, m.previewW(), m.previewH(), m.proto))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
 // afterCursorMove clamps the cursor, keeps the preview/debounce in sync, and
 // loads the next page when the list nears its end.
 func (m *model) afterCursorMove() tea.Cmd {
 	m.clampCursor()
+	if m.view == "people" {
+		return nil // people list: no preview, no paging
+	}
 	var cmds []tea.Cmd
+	if os.Getenv("IMTUI_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[page cursor=%d len=%d next=%q loading=%v]\n",
+			m.cursor, len(m.assets), m.nextCursor, m.loadingMore)
+	}
 	if tick := m.schedulePreview(); tick != nil {
 		cmds = append(cmds, tick)
 	}
-	if len(m.assets) > 0 && m.cursor >= len(m.assets)-10 && m.nextCursor != "" {
+	if len(m.assets) > 0 && m.cursor >= len(m.assets)-10 && m.nextCursor != "" && !m.loadingMore {
+		m.loadingMore = true
 		cmds = append(cmds, m.loadMore())
 	}
 	if len(cmds) == 0 {
@@ -573,7 +707,11 @@ func (m *model) afterCursorMove() tea.Cmd {
 }
 
 func (m *model) clampCursor() {
+	// clamp against whatever list the cursor indexes right now
 	n := len(m.assets)
+	if m.view == "people" {
+		n = len(m.people)
+	}
 	if n == 0 {
 		m.cursor = 0
 		return
@@ -691,7 +829,7 @@ func (m model) View() string {
 	if m.view == "people" {
 		b.WriteString(m.peopleList())
 	} else {
-		body = lipgloss.JoinHorizontal(lipgloss.Top, m.listBlock(), "  ", m.paneBlock())
+		body = m.assetView()
 		b.WriteString(body)
 	}
 	b.WriteString("\n")
@@ -706,6 +844,49 @@ func (m model) header() string {
 		ctx = subStyle.Render("  ·  " + m.context)
 	}
 	return title + ctx
+}
+
+// assetView composes the list (left) and preview pane (right).
+func (m model) assetView() string {
+	if m.proto == "kitty" {
+		return m.assetViewKitty()
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, m.listBlock(), "  ", m.paneBlock())
+}
+
+// assetViewKitty joins list and pane line-by-line. The image line carries
+// only the list text and then the raw graphics sequence — anything drawn
+// after it on the same row (padding spaces) would land on the image, so it
+// is deliberately the last thing on its line.
+func (m model) assetViewKitty() string {
+	left := strings.Split(m.listBlock(), "\n")
+	right := m.paneLinesKitty()
+	n := len(left)
+	if len(right) > n {
+		n = len(right)
+	}
+	rows := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		l := ""
+		if i < len(left) {
+			l = left[i]
+		}
+		l = padRight(l, listW)
+		r := ""
+		if i < len(right) {
+			r = right[i]
+		}
+		rows = append(rows, l+"  "+r)
+	}
+	return strings.Join(rows, "\n")
+}
+
+func padRight(s string, w int) string {
+	pad := w - lipgloss.Width(s)
+	if pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
 }
 
 // listW is the column width of the asset list (left pane).
@@ -760,12 +941,40 @@ func (m model) paneBlock() string {
 	}
 	boxW := m.previewW() + 2
 	box := borderStyle.Render(clipWidth(art, boxW))
+	return strings.Join(append([]string{box}, m.assetMeta(boxW)...), "\n")
+}
 
+// paneLinesKitty is the right-hand pane for kitty graphics mode: the image
+// occupies previewH rows (the graphics sequence is the first line's entire
+// content — nothing may be printed after it), then metadata below.
+func (m model) paneLinesKitty() []string {
+	a := m.selected()
+	if a == nil {
+		return nil
+	}
+	var lines []string
+	if m.preview != "" {
+		lines = append(lines, m.preview)
+	} else {
+		lines = append(lines, dimStyle.Render(strings.Repeat("·", m.previewW())))
+	}
+	for i := 1; i < m.previewH(); i++ {
+		lines = append(lines, "")
+	}
+	return append(lines, m.assetMeta(64)...)
+}
+
+// assetMeta renders the description / location / people / OCR block.
+func (m model) assetMeta(w int) []string {
+	a := m.selected()
+	if a == nil {
+		return nil
+	}
 	var meta []string
 	if d, ok := m.detail[a.ID]; ok {
 		if d.ExifInfo != nil {
 			if d.ExifInfo.Description != "" {
-				meta = append(meta, infoStyle.Render("“"+truncate(d.ExifInfo.Description, boxW)+"”"))
+				meta = append(meta, infoStyle.Render("“"+truncate(d.ExifInfo.Description, w)+"”"))
 			}
 			loc := []string{}
 			for _, l := range []string{d.ExifInfo.City, d.ExifInfo.State, d.ExifInfo.Country} {
@@ -778,7 +987,7 @@ func (m model) paneBlock() string {
 			}
 		}
 		if names := personNames(d); len(names) > 0 {
-			meta = append(meta, subStyle.Render("people: "+truncate(strings.Join(names, ", "), boxW)))
+			meta = append(meta, subStyle.Render("people: "+truncate(strings.Join(names, ", "), w)))
 		}
 	}
 	if m.ocrShow {
@@ -786,10 +995,10 @@ func (m model) paneBlock() string {
 			if t == "" {
 				t = "(no text detected)"
 			}
-			meta = append(meta, subStyle.Render("OCR: "+wordWrap(t, boxW)))
+			meta = append(meta, subStyle.Render("OCR: "+wordWrap(t, w)))
 		}
 	}
-	return strings.Join(append([]string{box}, meta...), "\n")
+	return meta
 }
 
 // clipWidth hard-caps each line's visual width (ANSI-aware), so
