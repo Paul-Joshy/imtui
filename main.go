@@ -40,7 +40,7 @@ func main() {
 
 	m := initialModel(c, cfg)
 	m.proto = detectImageProtocol(cfg)
-	if m.proto == "kitty" {
+	if m.graphicsMode() {
 		queryCellSize() // real cell pixel size → exact photo proportions
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -337,6 +337,20 @@ func renderPreview(c *Client, id string, cols, rows int, proto string) tea.Cmd {
 				place: wrapTmuxAPC(place),
 				cols:  cols,
 				rows:  rows,
+			}
+		}
+		if proto == "iterm" {
+			// iTerm2 draws the JPEG as-is over the aspect-fitted cells
+			cols, rows = fitPreviewCells(path, cols, rows)
+			art, err := itermImageSequence(path, cols, rows)
+			if err != nil {
+				return previewMsg{id: id, err: err}
+			}
+			return previewMsg{
+				id:   id,
+				art:  wrapTmuxPassthroughCSI(art),
+				cols: cols,
+				rows: rows,
 			}
 		}
 		out, err := exec.Command("chafa",
@@ -927,14 +941,18 @@ func sanitizeFileName(name string) string {
 // re-transmit. cols/rows carry the aspect-fitted placement size for the
 // view (0 = symbols mode / full pane).
 func (m *model) showArt(id, art string, cols, rows int) {
-	kid := kittyIDFor(id)
-	if m.lastKittyID != 0 && m.lastKittyID != kid {
-		art += kittyDelete(m.lastKittyID)
+	// kitty-only bookkeeping: iTerm2 replaces image cells when their line
+	// is redrawn, so no delete dance is needed there
+	if m.proto == "kitty" {
+		kid := kittyIDFor(id)
+		if m.lastKittyID != 0 && m.lastKittyID != kid {
+			art += kittyDelete(m.lastKittyID)
+		}
+		m.lastKittyID = kid
 	}
 	m.preview = art
 	m.previewCols = cols
 	m.previewRows = rows
-	m.lastKittyID = kid
 	m.freshID = id
 	m.lastShow = time.Now()
 }
@@ -1247,9 +1265,15 @@ func (m model) header() string {
 	return title + ctx
 }
 
+// graphicsMode reports whether the terminal draws real images (kitty
+// graphics protocol or iTerm2's OSC 1337), sharing the same layout logic.
+func (m model) graphicsMode() bool {
+	return m.proto == "kitty" || m.proto == "iterm"
+}
+
 // assetView composes the list (left) and preview pane (right).
 func (m model) assetView() string {
-	if m.proto == "kitty" {
+	if m.graphicsMode() {
 		return m.assetViewKitty()
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, m.listBlock(), "  ", m.paneBlock())

@@ -350,3 +350,51 @@ func TestTabCompletesCopyInput(t *testing.T) {
 		t.Fatalf("second tab: got %q want %q", got, "Desktop/birthday/")
 	}
 }
+
+func TestItermSequence(t *testing.T) {
+	dir := t.TempDir()
+	jpg := filepath.Join(dir, "p.jpeg")
+	os.WriteFile(jpg, []byte{0xFF, 0xD8, 0xFF, 0xE0, 'j', 'p', 'e', 'g'}, 0o644)
+
+	seq, err := itermImageSequence(jpg, 30, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(seq, "\x1b]1337;File=inline=1;size=8;width=30;height=15;preserveAspectRatio=1;doNotMoveCursor=1:") {
+		t.Fatalf("bad prefix: %q", seq[:60])
+	}
+	if !strings.HasSuffix(seq, "\x07") {
+		t.Fatal("sequence must end with BEL")
+	}
+	// the payload is the base64 of the file, and it must not contain ESC
+	b64 := seq[strings.Index(seq, ":")+1 : len(seq)-1]
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil || string(raw) != "\xff\xd8\xff\xe0jpeg" {
+		t.Fatalf("payload mismatch: %v %q", err, raw)
+	}
+	if strings.Contains(seq, "\x1b_") || strings.ContainsRune(b64, 0x1b) {
+		t.Fatal("payload must be escape-free for tmux doubling")
+	}
+}
+
+func TestDetectIterm(t *testing.T) {
+	t.Setenv("IMTUI_PROTOCOL", "")
+	t.Setenv("KITTY_WINDOW_ID", "")
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	if got := detectImageProtocol(Config{}); got != "iterm" {
+		t.Fatalf("TERM_PROGRAM=iTerm.app: got %q", got)
+	}
+	t.Setenv("TERM_PROGRAM", "")
+	t.Setenv("ITERM_SESSION_ID", "w0t0p0:ABC")
+	if got := detectImageProtocol(Config{}); got != "iterm" {
+		t.Fatalf("ITERM_SESSION_ID: got %q", got)
+	}
+	t.Setenv("ITERM_SESSION_ID", "")
+	if got := detectImageProtocol(Config{}); got != "symbols" {
+		t.Fatalf("no markers: got %q", got)
+	}
+	if got := detectImageProtocol(Config{ImageProtocol: "iterm"}); got != "iterm" {
+		t.Fatalf("explicit config: got %q", got)
+	}
+}

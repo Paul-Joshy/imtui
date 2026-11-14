@@ -19,12 +19,13 @@ browser.
 
 - **Browse** — newest photos first, paged as you scroll
 - **Real-pixel previews** — in kitty/ghostty-class terminals, photos are
-  drawn with the kitty graphics protocol (actual pixels, not ASCII art);
-  falls back to crisp chafa half-block previews everywhere else
+  drawn with the kitty graphics protocol; in iTerm2 they use iTerm2's own
+  inline-image protocol (actual pixels, not ASCII art); it falls back to
+  crisp chafa half-block previews everywhere else
 - **Fast** — thumbnails are read straight off the server's disk when the
   library is local, renders are cached in memory and on disk, and neighbors
   are pre-rendered as you move
-- **Proportionate previews** — the kitty placement is sized per photo
+- **Proportionate previews** — the image placement is sized per photo
   (using the terminal's real cell pixel size when it can be queried), so
   portraits stay portrait; images are centered in the pane
 - **Copy out** — select photos with `space`, press `c` to download the originals
@@ -84,7 +85,8 @@ preview_height = 20
 # generated thumbnails on disk — read directly instead of the API when the
 # Immich library is local (docker compose usually mounts ./library)
 thumbs_dir = "~/Documents/immich-app/library/thumbs"
-# preview rendering: "auto" (detect kitty), "kitty", or "symbols" (ANSI art)
+# preview rendering: "auto" (detect kitty/iTerm2), "kitty", "iterm", or
+# "symbols" (ANSI art)
 image_protocol = "auto"
 # default destination pre-filled when you press c to copy originals
 copy_dir = "~/Desktop/immich-exports"

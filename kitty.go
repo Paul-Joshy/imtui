@@ -83,14 +83,19 @@ func kittyDelete(id int) string {
 func detectImageProtocol(cfg Config) string {
 	switch {
 	case os.Getenv("IMTUI_PROTOCOL") != "":
-		if os.Getenv("IMTUI_PROTOCOL") == "kitty" {
+		switch os.Getenv("IMTUI_PROTOCOL") {
+		case "kitty":
 			return "kitty"
+		case "iterm":
+			return "iterm"
 		}
 		return "symbols"
 	}
 	switch cfg.ImageProtocol {
 	case "kitty":
 		return "kitty"
+	case "iterm":
+		return "iterm"
 	case "symbols":
 		return "symbols"
 	}
@@ -102,6 +107,10 @@ func detectImageProtocol(cfg Config) string {
 	}
 	if os.Getenv("TERM_PROGRAM") == "kitty" {
 		return "kitty"
+	}
+	// iTerm2 speaks its own OSC 1337 inline-image protocol
+	if os.Getenv("TERM_PROGRAM") == "iTerm.app" || os.Getenv("ITERM_SESSION_ID") != "" {
+		return "iterm"
 	}
 	if os.Getenv("TMUX") != "" {
 		if out, err := exec.Command("tmux", "display-message", "-p", "#{client_termname}").Output(); err == nil {
